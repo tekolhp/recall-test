@@ -1,12 +1,14 @@
 import "dotenv/config";
 import express from "express";
+import { createServer } from "node:http";
 import { execFile } from "node:child_process";
 import { writeFile, unlink, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { WebSocketServer, WebSocket } from "ws";
 
 const app = express();
-app.use(express.json({ limit: "5mb" })); // larger limit for base64 images
+app.use(express.json({ limit: "5mb" }));
 
 const API_KEY = process.env.RECALL_API_KEY!;
 const REGION = process.env.RECALL_REGION || "us-west-2";
@@ -18,11 +20,17 @@ if (!API_KEY) {
   process.exit(1);
 }
 
+// ── Bypass ngrok interstitial for all responses ─────────────────────
+app.use((_req, res, next) => {
+  res.setHeader("ngrok-skip-browser-warning", "true");
+  next();
+});
+
 // ── Bot fleet state ──────────────────────────────────────────────────
 
 interface BotRecord {
-  id: string; // local ID (bot-1, bot-2, ...)
-  recallBotId: string; // Recall.ai bot UUID
+  id: string;
+  recallBotId: string;
   name: string;
   status: string;
   breakoutRoom: string | null;
@@ -32,7 +40,7 @@ interface BotRecord {
 
 const bots = new Map<string, BotRecord>();
 
-// 1-pixel silent JPEG for enabling automatic_video_output
+// 1-pixel silent JPEG for enabling automatic_video_output (API fallback)
 const SILENT_JPEG =
   "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AKwA//9k=";
 
@@ -40,13 +48,192 @@ const SILENT_JPEG =
 const SILENT_MP3 =
   "//uQxAAAAAANIAAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV";
 
+// ── ngrok auto-detection ─────────────────────────────────────────────
+
+let ngrokUrl: string | null = null;
+
+async function detectNgrokUrl(): Promise<string | null> {
+  try {
+    const res = await fetch("http://127.0.0.1:4040/api/tunnels");
+    const data = await res.json();
+    const httpsTunnel = (data.tunnels as any[])?.find(
+      (t: any) => t.proto === "https"
+    );
+    if (httpsTunnel) {
+      ngrokUrl = httpsTunnel.public_url;
+      console.log(`[server] Detected ngrok URL: ${ngrokUrl}`);
+      return ngrokUrl;
+    }
+  } catch {
+    console.log("[server] ngrok not running — using output_video API fallback");
+  }
+  return null;
+}
+
+app.get("/api/ngrok-status", async (_req, res) => {
+  const url = await detectNgrokUrl();
+  res.json({ available: !!url, url });
+});
+
+// ── WebSocket server for Output Media pages ─────────────────────────
+
+const server = createServer(app);
+const wss = new WebSocketServer({ server, path: "/ws/output-media" });
+
+// Separate WebSocket for the renderer to push frames directly (no HTTP overhead)
+const wssPush = new WebSocketServer({ server, path: "/ws/frame-push" });
+
+wssPush.on("connection", (ws) => {
+  console.log("[ws] Frame push client connected (renderer)");
+
+  ws.on("message", (data: Buffer) => {
+    // Received binary JPEG frame from renderer — broadcast to all output media pages
+    lastFrame = data;
+    for (const [, clients] of outputMediaClients) {
+      for (const client of clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(data);
+        }
+      }
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("[ws] Frame push client disconnected");
+  });
+});
+
+const outputMediaClients = new Map<string, Set<WebSocket>>();
+
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url!, `http://localhost`);
+  const botId = url.searchParams.get("bot") || "unknown";
+
+  if (!outputMediaClients.has(botId)) {
+    outputMediaClients.set(botId, new Set());
+  }
+  outputMediaClients.get(botId)!.add(ws);
+
+  console.log(`[ws] Output media page connected for bot: ${botId}`);
+
+  // Send current static frame if one exists
+  if (lastFrame) {
+    ws.send(lastFrame);
+  }
+
+  ws.on("close", () => {
+    outputMediaClients.get(botId)?.delete(ws);
+    if (outputMediaClients.get(botId)?.size === 0) {
+      outputMediaClients.delete(botId);
+    }
+    console.log(`[ws] Output media page disconnected for bot: ${botId}`);
+  });
+});
+
+// Last frame buffer for new connections
+let lastFrame: Buffer | null = null;
+
+function broadcastToOutputMediaPages(frame: Buffer) {
+  lastFrame = frame;
+  for (const [, clients] of outputMediaClients) {
+    for (const ws of clients) {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(frame);
+      }
+    }
+  }
+}
+
+function getConnectedClientCount(): number {
+  let count = 0;
+  for (const [, clients] of outputMediaClients) {
+    count += clients.size;
+  }
+  return count;
+}
+
+// ── Output Media HTML page (rendered by bot's headless browser) ─────
+
+const OUTPUT_MEDIA_HTML = `<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8">
+<style>
+  * { margin: 0; padding: 0; }
+  body { width: 1280px; height: 720px; overflow: hidden; background: #000; }
+  canvas { display: block; }
+</style>
+</head><body>
+<canvas id="c" width="1280" height="720"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const params = new URLSearchParams(location.search);
+const botId = params.get('bot') || 'unknown';
+
+let ws;
+let reconnectDelay = 1000;
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/ws/output-media?bot=' + botId);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    console.log('[output-media] Connected');
+    reconnectDelay = 1000;
+  };
+
+  ws.onmessage = async (evt) => {
+    if (evt.data instanceof ArrayBuffer) {
+      const blob = new Blob([evt.data], { type: 'image/jpeg' });
+      const bmp = await createImageBitmap(blob);
+      ctx.drawImage(bmp, 0, 0, 1280, 720);
+      bmp.close();
+    } else {
+      try {
+        const cmd = JSON.parse(evt.data);
+        if (cmd.type === 'clear') {
+          ctx.fillStyle = '#000';
+          ctx.fillRect(0, 0, 1280, 720);
+        }
+      } catch {}
+    }
+  };
+
+  ws.onclose = () => {
+    console.log('[output-media] Disconnected, reconnecting in ' + reconnectDelay + 'ms');
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connect();
+</script>
+</body></html>`;
+
+app.get("/output-media", (_req, res) => {
+  res.type("html").send(OUTPUT_MEDIA_HTML);
+});
+
+// ── Output Media frame push endpoint ────────────────────────────────
+
+app.post("/api/output-media/frame", (req, res) => {
+  const { b64_data } = req.body;
+  if (!b64_data) {
+    res.status(400).json({ error: "b64_data is required" });
+    return;
+  }
+
+  const frame = Buffer.from(b64_data, "base64");
+  broadcastToOutputMediaPages(frame);
+
+  res.json({ ok: true, clients: getConnectedClientCount() });
+});
+
 // ── Desktop SDK Endpoints ────────────────────────────────────────────
 
-/**
- * POST /api/create-upload
- *
- * Creates a Desktop SDK upload on Recall.ai and returns the upload token.
- */
 app.post("/api/create-upload", async (_req, res) => {
   try {
     const response = await fetch(`${BASE_URL}/api/v1/sdk_upload/`, {
@@ -92,16 +279,10 @@ app.post("/api/create-upload", async (_req, res) => {
   }
 });
 
-/**
- * POST /webhooks/recall
- *
- * Handles webhooks from Recall.ai (SDK uploads + bot status changes).
- */
 app.post("/webhooks/recall", async (req, res) => {
   const { event, data } = req.body;
   console.log(`[webhook] Received: ${event}`);
 
-  // Desktop SDK webhooks
   if (event === "sdk_upload.complete") {
     const recordingId = data?.recording?.id;
     console.log(`[webhook] Upload complete! Recording ID: ${recordingId}`);
@@ -153,7 +334,6 @@ app.post("/webhooks/recall", async (req, res) => {
     }
   }
 
-  // Breakout room webhooks
   if (event === "bot.breakout_room_entered") {
     const recallBotId = data?.bot_id || data?.id;
     const roomName = data?.breakout_room?.name || "Unknown Room";
@@ -185,26 +365,20 @@ app.post("/webhooks/recall", async (req, res) => {
 
 // ── Bot Fleet Endpoints ──────────────────────────────────────────────
 
-/**
- * POST /api/bots/deploy
- *
- * Deploy up to 10 bots to a Zoom meeting. Each bot:
- * - Records audio/video
- * - Captures meeting captions for transcript
- * - Accepts breakout room invites
- * - Has output_video and output_audio enabled via automatic defaults
- */
 app.post("/api/bots/deploy", async (req, res) => {
   const {
     meeting_url,
     bot_count = 1,
-    bot_name_prefix = "Assistant",
+    bot_name_prefix = "Helper",
   } = req.body;
 
   if (!meeting_url) {
     res.status(400).json({ error: "meeting_url is required" });
     return;
   }
+
+  // Re-detect ngrok URL before deploying
+  await detectNgrokUrl();
 
   const count = Math.min(Math.max(1, bot_count), 10);
   const created: BotRecord[] = [];
@@ -213,7 +387,7 @@ app.post("/api/bots/deploy", async (req, res) => {
   for (let i = 1; i <= count; i++) {
     const localId = `bot-${i}`;
 
-    const botPayload = {
+    const botPayload: any = {
       meeting_url,
       bot_name: `${bot_name_prefix} ${i}`,
       recording_config: {
@@ -221,25 +395,40 @@ app.post("/api/bots/deploy", async (req, res) => {
           provider: { meeting_captions: {} },
         },
       },
-      // Set default images/audio so output_video and output_audio endpoints work
-      automatic_video_output: {
-        in_call_recording: {
-          kind: "jpeg" as const,
-          b64_data: SILENT_JPEG,
-        },
-      },
-      automatic_audio_output: {
-        in_call_recording: {
-          data: {
-            kind: "mp3" as const,
-            b64_data: SILENT_MP3,
-          },
-        },
-      },
       zoom: {
         breakout_room_handling: "auto_accept_all_invites",
       },
     };
+
+    if (ngrokUrl) {
+      // Webpage mode: bot renders our page as its camera at 30fps
+      botPayload.output_media = {
+        camera: {
+          kind: "webpage",
+          config: {
+            url: `${ngrokUrl}/output-media?bot=${localId}&ngrok-skip-browser-warning=true`,
+          },
+        },
+      };
+      // Audio output still via API
+      botPayload.automatic_audio_output = {
+        in_call_recording: {
+          data: { kind: "mp3" as const, b64_data: SILENT_MP3 },
+        },
+      };
+      console.log(`[bot] ${localId} using webpage mode: ${ngrokUrl}/output-media?bot=${localId}`);
+    } else {
+      // Fallback: output_video API (rate-limited 5fps)
+      botPayload.automatic_video_output = {
+        in_call_recording: { kind: "jpeg" as const, b64_data: SILENT_JPEG },
+      };
+      botPayload.automatic_audio_output = {
+        in_call_recording: {
+          data: { kind: "mp3" as const, b64_data: SILENT_MP3 },
+        },
+      };
+      console.log(`[bot] ${localId} using API fallback mode (no ngrok)`);
+    }
 
     try {
       const response = await fetch(`${BASE_URL}/api/v1/bot/`, {
@@ -280,16 +469,10 @@ app.post("/api/bots/deploy", async (req, res) => {
     }
   }
 
-  res.json({ created, errors });
+  res.json({ created, errors, mode: ngrokUrl ? "webpage" : "api" });
 });
 
-/**
- * GET /api/bots
- *
- * List all bots, polling Recall.ai for fresh status.
- */
 app.get("/api/bots", async (_req, res) => {
-  // Refresh statuses from Recall.ai for active bots
   for (const bot of bots.values()) {
     if (["done", "fatal"].includes(bot.status)) continue;
 
@@ -314,11 +497,6 @@ app.get("/api/bots", async (_req, res) => {
   res.json(Array.from(bots.values()));
 });
 
-/**
- * GET /api/bots/:id
- *
- * Get a single bot with fresh Recall.ai data.
- */
 app.get("/api/bots/:id", async (req, res) => {
   const bot = bots.get(req.params.id);
   if (!bot) {
@@ -349,11 +527,6 @@ app.get("/api/bots/:id", async (req, res) => {
   }
 });
 
-/**
- * POST /api/bots/:id/leave
- *
- * Remove a bot from the call.
- */
 app.post("/api/bots/:id/leave", async (req, res) => {
   const bot = bots.get(req.params.id);
   if (!bot) {
@@ -384,9 +557,6 @@ app.post("/api/bots/:id/leave", async (req, res) => {
   }
 });
 
-/**
- * POST /api/bots/remove-all
- */
 app.post("/api/bots/remove-all", async (_req, res) => {
   const results: { id: string; ok: boolean; error?: string }[] = [];
 
@@ -411,18 +581,11 @@ app.post("/api/bots/remove-all", async (_req, res) => {
   res.json({ results });
 });
 
-/**
- * POST /api/bots/force-remove-all
- *
- * Queries Recall.ai for ALL active bots in the workspace and removes them.
- * Works even if the server was restarted and lost local state.
- */
 app.post("/api/bots/force-remove-all", async (_req, res) => {
   const removed: string[] = [];
   const errors: { id: string; error: string }[] = [];
 
   try {
-    // Fetch all bots that are not done/fatal
     const activeStatuses = [
       "joining_call",
       "in_waiting_room",
@@ -463,7 +626,6 @@ app.post("/api/bots/force-remove-all", async (_req, res) => {
       }
     }
 
-    // Also clear local state
     bots.clear();
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -473,12 +635,8 @@ app.post("/api/bots/force-remove-all", async (_req, res) => {
   res.json({ removed, errors, total: removed.length });
 });
 
-/**
- * POST /api/bots/:id/send-image
- *
- * Send a JPEG image to a bot's camera feed via Recall.ai output_video API.
- * Body: { b64_data: "base64-encoded JPEG" }
- */
+// ── Bot image/audio endpoints ────────────────────────────────────────
+
 app.post("/api/bots/:id/send-image", async (req, res) => {
   const bot = bots.get(req.params.id);
   if (!bot) {
@@ -492,6 +650,15 @@ app.post("/api/bots/:id/send-image", async (req, res) => {
     return;
   }
 
+  // If webpage mode, push via WebSocket
+  if (ngrokUrl && getConnectedClientCount() > 0) {
+    const frame = Buffer.from(b64_data, "base64");
+    broadcastToOutputMediaPages(frame);
+    res.json({ ok: true, mode: "webpage" });
+    return;
+  }
+
+  // Fallback: output_video API
   try {
     const response = await fetch(
       `${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`,
@@ -501,10 +668,7 @@ app.post("/api/bots/:id/send-image", async (req, res) => {
           Authorization: `Token ${API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          kind: "jpeg",
-          b64_data,
-        }),
+        body: JSON.stringify({ kind: "jpeg", b64_data }),
       }
     );
 
@@ -515,18 +679,12 @@ app.post("/api/bots/:id/send-image", async (req, res) => {
       return;
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, mode: "api" });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * POST /api/bots/broadcast-image
- *
- * Send the same JPEG image to ALL bots' camera feeds.
- * Body: { b64_data: "base64-encoded JPEG" }
- */
 app.post("/api/bots/broadcast-image", async (req, res) => {
   const { b64_data } = req.body;
   if (!b64_data) {
@@ -534,41 +692,39 @@ app.post("/api/bots/broadcast-image", async (req, res) => {
     return;
   }
 
-  let sent = 0;
-  let failed = 0;
-
-  for (const bot of bots.values()) {
-    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
-
-    try {
-      const response = await fetch(
-        `${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`,
-        {
-          method: "POST",
-          headers: {
-            Authorization: `Token ${API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ kind: "jpeg", b64_data }),
-        }
-      );
-
-      if (response.ok) sent++;
-      else failed++;
-    } catch {
-      failed++;
-    }
+  // If webpage mode, push via WebSocket (instant, no rate limit)
+  if (ngrokUrl && getConnectedClientCount() > 0) {
+    const frame = Buffer.from(b64_data, "base64");
+    broadcastToOutputMediaPages(frame);
+    res.json({ ok: true, sent: getConnectedClientCount(), failed: 0, mode: "webpage" });
+    return;
   }
 
-  res.json({ ok: true, sent, failed });
+  // Fallback: output_video API (rate-limited)
+  const activeBotList = Array.from(bots.values()).filter(
+    (b) => !["done", "fatal", "leaving"].includes(b.status)
+  );
+
+  const body = JSON.stringify({ kind: "jpeg", b64_data });
+  const results = await Promise.allSettled(
+    activeBotList.map((bot) =>
+      fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`, {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body,
+      }).then((r) => r.ok)
+    )
+  );
+
+  const sent = results.filter((r) => r.status === "fulfilled" && r.value).length;
+  const failed = results.length - sent;
+
+  res.json({ ok: true, sent, failed, mode: "api" });
 });
 
-/**
- * POST /api/bots/:id/send-audio
- *
- * Send an MP3 audio clip to a bot via Recall.ai output_audio API.
- * Body: { b64_data: "base64-encoded MP3" }
- */
 app.post("/api/bots/:id/send-audio", async (req, res) => {
   const bot = bots.get(req.params.id);
   if (!bot) {
@@ -591,12 +747,7 @@ app.post("/api/bots/:id/send-audio", async (req, res) => {
           Authorization: `Token ${API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          data: {
-            kind: "mp3",
-            b64_data,
-          },
-        }),
+        body: JSON.stringify({ data: { kind: "mp3", b64_data } }),
       }
     );
 
@@ -613,13 +764,6 @@ app.post("/api/bots/:id/send-audio", async (req, res) => {
   }
 });
 
-/**
- * POST /api/bots/:id/send-audio-webm
- *
- * Accepts a webm audio chunk, transcodes to MP3 via ffmpeg, then sends
- * to Recall.ai output_audio. Used for real-time mic streaming.
- * Body: { b64_data: "base64-encoded webm audio" }
- */
 app.post("/api/bots/:id/send-audio-webm", async (req, res) => {
   const bot = bots.get(req.params.id);
   if (!bot) {
@@ -638,10 +782,8 @@ app.post("/api/bots/:id/send-audio-webm", async (req, res) => {
   const mp3Path = path.join(tmpdir(), `recall-${id}.mp3`);
 
   try {
-    // Write webm to temp file
     await writeFile(webmPath, Buffer.from(b64_data, "base64"));
 
-    // Transcode to MP3
     await new Promise<void>((resolve, reject) => {
       execFile(
         "ffmpeg",
@@ -651,7 +793,6 @@ app.post("/api/bots/:id/send-audio-webm", async (req, res) => {
       );
     });
 
-    // Read MP3 and send to Recall
     const mp3Buffer = await readFile(mp3Path);
     const mp3B64 = mp3Buffer.toString("base64");
 
@@ -663,9 +804,7 @@ app.post("/api/bots/:id/send-audio-webm", async (req, res) => {
           Authorization: `Token ${API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          data: { kind: "mp3", b64_data: mp3B64 },
-        }),
+        body: JSON.stringify({ data: { kind: "mp3", b64_data: mp3B64 } }),
       }
     );
 
@@ -680,18 +819,11 @@ app.post("/api/bots/:id/send-audio-webm", async (req, res) => {
     console.error(`[bot] audio transcode failed for ${bot.id}:`, err.message);
     res.status(500).json({ error: err.message });
   } finally {
-    // Cleanup temp files
     unlink(webmPath).catch(() => {});
     unlink(mp3Path).catch(() => {});
   }
 });
 
-/**
- * POST /api/bots/broadcast-audio-webm
- *
- * Transcode webm → MP3 once, then send to all active bots.
- * Body: { b64_data: "base64-encoded webm audio" }
- */
 app.post("/api/bots/broadcast-audio-webm", async (req, res) => {
   const { b64_data } = req.body;
   if (!b64_data) {
@@ -718,32 +850,26 @@ app.post("/api/bots/broadcast-audio-webm", async (req, res) => {
     const mp3Buffer = await readFile(mp3Path);
     const mp3B64 = mp3Buffer.toString("base64");
 
-    let sent = 0;
-    let failed = 0;
+    const activeBotList = Array.from(bots.values()).filter(
+      (b) => !["done", "fatal", "leaving"].includes(b.status)
+    );
 
-    for (const bot of bots.values()) {
-      if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    const body = JSON.stringify({ data: { kind: "mp3", b64_data: mp3B64 } });
+    const results = await Promise.allSettled(
+      activeBotList.map((bot) =>
+        fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_audio/`, {
+          method: "POST",
+          headers: {
+            Authorization: `Token ${API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body,
+        }).then((r) => r.ok)
+      )
+    );
 
-      try {
-        const response = await fetch(
-          `${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_audio/`,
-          {
-            method: "POST",
-            headers: {
-              Authorization: `Token ${API_KEY}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              data: { kind: "mp3", b64_data: mp3B64 },
-            }),
-          }
-        );
-        if (response.ok) sent++;
-        else failed++;
-      } catch {
-        failed++;
-      }
-    }
+    const sent = results.filter((r) => r.status === "fulfilled" && r.value).length;
+    const failed = results.length - sent;
 
     res.json({ ok: true, sent, failed });
   } catch (err: any) {
@@ -754,12 +880,6 @@ app.post("/api/bots/broadcast-audio-webm", async (req, res) => {
   }
 });
 
-/**
- * GET /api/bots/:id/transcript
- *
- * Get transcript for a bot. Fetches from Recall.ai bot data.
- * Transcript is available after the bot finishes (status: done).
- */
 app.get("/api/bots/:id/transcript", async (req, res) => {
   const bot = bots.get(req.params.id);
   if (!bot) {
@@ -827,8 +947,15 @@ app.get("/api/upload-status/:id", async (req, res) => {
 
 // ── Start server ─────────────────────────────────────────────────────
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
   console.log(`[server] Backend running on http://localhost:${PORT}`);
-  console.log(`[server] No external tunnels required`);
-  console.log(`[server] Bot output_video + output_audio via direct Recall.ai API`);
+  detectNgrokUrl().then((url) => {
+    if (url) {
+      console.log(`[server] Output Media Webpage mode: ${url}/output-media`);
+      console.log(`[server] Bots will render page at 30fps — no rate limit`);
+    } else {
+      console.log(`[server] Fallback mode: output_video API (5fps max)`);
+      console.log(`[server] Start ngrok for 30fps: ngrok http 3000`);
+    }
+  });
 });

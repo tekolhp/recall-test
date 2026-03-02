@@ -44,7 +44,40 @@ let framesSent = 0;
 let framesErrors = 0;
 let isSendingFrame = false;
 
+// Output Media mode (30fps via ngrok webpage vs 5fps via API)
+let outputMediaMode = false;
+let pushSocket = null; // Direct WebSocket to server for frame pushing
+
 const bridge = window.recallBridge;
+
+// ── Check ngrok / output media status ────────────────────────────────
+async function checkNgrokStatus() {
+  try {
+    const status = await bridge.getNgrokStatus();
+    outputMediaMode = status.available;
+    if (outputMediaMode && !pushSocket) {
+      connectPushSocket();
+    }
+    updateStreamInfo();
+  } catch {
+    outputMediaMode = false;
+  }
+}
+
+function connectPushSocket() {
+  if (pushSocket) return;
+  pushSocket = new WebSocket("ws://localhost:3000/ws/frame-push");
+  pushSocket.binaryType = "arraybuffer";
+  pushSocket.onopen = () => console.log("[ws] Frame push socket connected");
+  pushSocket.onclose = () => {
+    pushSocket = null;
+    // Reconnect if still in output media mode
+    if (outputMediaMode) setTimeout(connectPushSocket, 2000);
+  };
+  pushSocket.onerror = () => pushSocket?.close();
+}
+
+checkNgrokStatus();
 
 // ── Listen for toggle state changes ───────────────────────────────────
 if (bridge.onToggleState) {
@@ -91,8 +124,10 @@ btnDeploy.addEventListener("click", async () => {
     }
 
     activeBots = result.created || [];
+    outputMediaMode = result.mode === "webpage";
+    const modeLabel = outputMediaMode ? "Webpage 30fps" : "API 5fps";
     statusBar.textContent =
-      `Deployed ${activeBots.length} bot(s)` +
+      `Deployed ${activeBots.length} bot(s) [${modeLabel}]` +
       (result.errors?.length ? ` (${result.errors.length} failed)` : "");
 
     renderBots();
@@ -548,17 +583,17 @@ function startFrameSending() {
   framesErrors = 0;
   const ctx = streamCanvas.getContext("2d");
 
-  // Calculate interval: 300 req/min = 5 req/sec total across all bots
-  // For N active bots, we can send 5/N frames per second per bot
-  // We send one frame to ALL bots each tick, so interval = (N * 1000) / 5
   function getIntervalMs() {
+    if (outputMediaMode) {
+      // Webpage mode: ~30fps (no rate limit, frames go via WebSocket)
+      return 33;
+    }
+    // API mode: rate-limited at 300 req/min
     const activeBotCount = activeBots.filter(
       (b) => !["done", "fatal", "leaving"].includes(b.status)
     ).length;
     const n = Math.max(activeBotCount, 1);
-    // 300 req/min = 5 req/sec; each tick sends to N bots = N requests
-    // So max ticks/sec = 5/N, interval = N * 200ms
-    return Math.max(n * 200, 500); // minimum 500ms between sends
+    return n * 200;
   }
 
   async function sendFrame() {
@@ -566,36 +601,46 @@ function startFrameSending() {
     isSendingFrame = true;
 
     try {
-      // Draw current video frame with high-quality smoothing
       ctx.imageSmoothingEnabled = true;
       ctx.imageSmoothingQuality = "high";
       ctx.drawImage(streamVideo, 0, 0, 1280, 720);
-      // JPEG quality 0.95 — max recommended by Recall (1.3MB file limit)
-      const jpegDataUrl = streamCanvas.toDataURL("image/jpeg", 0.95);
-      const b64 = jpegDataUrl.split(",")[1];
 
-      const result = await bridge.broadcastImage(b64);
-      framesSent++;
+      if (outputMediaMode && pushSocket && pushSocket.readyState === WebSocket.OPEN) {
+        // Direct WebSocket: send binary JPEG (no base64, no IPC, no HTTP)
+        streamCanvas.toBlob((blob) => {
+          if (blob && pushSocket && pushSocket.readyState === WebSocket.OPEN) {
+            blob.arrayBuffer().then((buf) => {
+              pushSocket.send(buf);
+              framesSent++;
+              updateStreamInfo();
+            });
+          }
+          isSendingFrame = false;
 
-      // Update all tile previews
-      for (const bot of activeBots) {
-        updateTilePreview(bot.id, b64);
+          if (videoFrameInterval !== null) {
+            videoFrameInterval = setTimeout(sendFrame, getIntervalMs());
+          }
+        }, "image/jpeg", 0.85);
+        return; // toBlob is async, the callback handles the rest
+      } else {
+        // Fallback: broadcast via output_video API (rate-limited)
+        const jpegDataUrl = streamCanvas.toDataURL("image/jpeg", 0.80);
+        const b64 = jpegDataUrl.split(",")[1];
+        await bridge.broadcastImage(b64);
+        framesSent++;
+        updateStreamInfo();
       }
-
-      updateStreamInfo();
     } catch {
       framesErrors++;
     } finally {
       isSendingFrame = false;
     }
 
-    // Schedule next frame with dynamic interval
     if (videoFrameInterval !== null) {
       videoFrameInterval = setTimeout(sendFrame, getIntervalMs());
     }
   }
 
-  // Start the loop
   videoFrameInterval = setTimeout(sendFrame, 100);
 }
 
@@ -615,13 +660,22 @@ function updateStreamInfo() {
     (b) => !["done", "fatal", "leaving"].includes(b.status)
   ).length;
 
-  const fpsPerBot = activeBotCount > 0 ? (5 / activeBotCount).toFixed(1) : "0";
+  let fpsDisplay;
+  if (outputMediaMode) {
+    fpsDisplay = videoActive ? "~30" : "0";
+  } else {
+    fpsDisplay = activeBotCount > 0 ? (5 / activeBotCount).toFixed(1) : "0";
+  }
+
+  const modeLabel = outputMediaMode ? "Webpage" : "API";
+  const modeColor = outputMediaMode ? "#00c853" : "#ffab00";
 
   streamInfo.innerHTML =
     `Video: ${videoActive ? "streaming" : "stopped"} | ` +
     `Audio: ${audioActive ? "recording" : "stopped"} | ` +
     `Sent: ${framesSent} frames | ` +
-    `Rate: <span class="rate">~${videoActive ? fpsPerBot : "0"} fps/bot</span>`;
+    `Rate: <span class="rate">~${fpsDisplay} fps/bot</span> | ` +
+    `Mode: <span style="color:${modeColor}">${modeLabel}</span>`;
 }
 
 // ── Real-time Audio Streaming ─────────────────────────────────────────

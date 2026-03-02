@@ -402,6 +402,31 @@ app.whenReady().then(async () => {
       return { error: err.message };
     }
   });
+
+  // ── Output Media (30fps webpage mode) ──────────────────────────────
+
+  ipcMain.handle("get-ngrok-status", async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/ngrok-status`);
+      return await res.json();
+    } catch (err: any) {
+      return { available: false, error: err.message };
+    }
+  });
+
+  ipcMain.handle("push-output-media-frame", async (_event, b64Data: string) => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/output-media/frame`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ b64_data: b64Data }),
+      });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
 });
 
 app.on("window-all-closed", () => {

@@ -51,4 +51,9 @@ contextBridge.exposeInMainWorld("recallBridge", {
     ipcRenderer.invoke("broadcast-audio-webm", b64Data),
   getBotTranscript: (botId: string) =>
     ipcRenderer.invoke("get-bot-transcript", botId),
+
+  // ── Output Media (30fps webpage mode) ──────────────────────────────
+  getNgrokStatus: () => ipcRenderer.invoke("get-ngrok-status"),
+  pushOutputMediaFrame: (b64Data: string) =>
+    ipcRenderer.invoke("push-output-media-frame", b64Data),
 });
