@@ -239,14 +239,6 @@ app.post("/api/bots/deploy", async (req, res) => {
       zoom: {
         breakout_room_handling: "auto_accept_all_invites",
       },
-      // Disable automatic bot detection — default config matches "assistant"
-      // in bot names and auto-removes them
-      automatic_leave: {
-        bot_detection: {
-          using_participant_events: null,
-          using_participant_names: null,
-        },
-      },
     };
 
     try {

@@ -223,23 +223,31 @@ function loadImageFile(file) {
     // Convert to JPEG base64 via canvas
     const img = new Image();
     img.onload = () => {
+      // Supersample: render at 2x then downscale for sharpest result
+      const hiRes = document.createElement("canvas");
+      hiRes.width = 2560;
+      hiRes.height = 1440;
+      const hiCtx = hiRes.getContext("2d");
+
+      hiCtx.fillStyle = "#000";
+      hiCtx.fillRect(0, 0, 2560, 1440);
+
+      const scale = Math.min(2560 / img.width, 1440 / img.height);
+      const w = img.width * scale;
+      const h = img.height * scale;
+      hiCtx.drawImage(img, (2560 - w) / 2, (1440 - h) / 2, w, h);
+
+      // Downscale to 1280x720 with high-quality interpolation
       const canvas = document.createElement("canvas");
       canvas.width = 1280;
       canvas.height = 720;
       const ctx = canvas.getContext("2d");
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(hiRes, 0, 0, 1280, 720);
 
-      // Black background
-      ctx.fillStyle = "#000";
-      ctx.fillRect(0, 0, 1280, 720);
-
-      // Fit image centered
-      const scale = Math.min(1280 / img.width, 720 / img.height);
-      const w = img.width * scale;
-      const h = img.height * scale;
-      ctx.drawImage(img, (1280 - w) / 2, (720 - h) / 2, w, h);
-
-      // Extract JPEG base64 (strip data:image/jpeg;base64, prefix)
-      const jpegDataUrl = canvas.toDataURL("image/jpeg", 0.85);
+      // JPEG quality 0.95 — max recommended by Recall (1.3MB limit)
+      const jpegDataUrl = canvas.toDataURL("image/jpeg", 0.95);
       pendingImageB64 = jpegDataUrl.split(",")[1];
       modalSend.disabled = false;
     };
@@ -482,7 +490,7 @@ btnStartVideo.addEventListener("click", async () => {
   try {
     if (source === "camera") {
       videoStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: 1280, height: 720 },
+        video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
         audio: false,
       });
     } else if (source === "screen") {
@@ -499,8 +507,8 @@ btnStartVideo.addEventListener("click", async () => {
           mandatory: {
             chromeMediaSource: "desktop",
             chromeMediaSourceId: screenSource.id,
-            maxWidth: 1280,
-            maxHeight: 720,
+            maxWidth: 1920,
+            maxHeight: 1080,
           },
         },
         audio: false,
@@ -558,9 +566,12 @@ function startFrameSending() {
     isSendingFrame = true;
 
     try {
-      // Draw current video frame to canvas
+      // Draw current video frame with high-quality smoothing
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
       ctx.drawImage(streamVideo, 0, 0, 1280, 720);
-      const jpegDataUrl = streamCanvas.toDataURL("image/jpeg", 0.7);
+      // JPEG quality 0.95 — max recommended by Recall (1.3MB file limit)
+      const jpegDataUrl = streamCanvas.toDataURL("image/jpeg", 0.95);
       const b64 = jpegDataUrl.split(",")[1];
 
       const result = await bridge.broadcastImage(b64);
