@@ -5,83 +5,134 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:" />
   <title>Recall.ai Desktop</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; padding: 16px; background: #1a1a2e; color: #eee; }
-    h1 { font-size: 16px; margin-bottom: 12px; }
-    #status { padding: 6px 10px; border-radius: 6px; background: #16213e; margin-bottom: 10px; font-size: 12px; }
-    #meeting-info { padding: 6px 10px; border-radius: 6px; background: #0f3460; margin-bottom: 10px; display: none; font-size: 12px; }
-    .controls { margin-bottom: 10px; }
-    button { padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; margin-right: 8px; }
-    #btn-record { background: #e94560; color: #fff; }
-    #btn-record:disabled { background: #555; cursor: not-allowed; }
-    #btn-stop { background: #533483; color: #fff; }
-    #btn-stop:disabled { background: #555; cursor: not-allowed; }
-
-    #video-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-      gap: 8px;
-      margin-bottom: 10px;
-      min-height: 160px;
-      background: #0a0a1a;
-      border-radius: 6px;
-      padding: 8px;
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #0a0a0a;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      color: #eee;
     }
-    .video-tile {
+    nav {
+      display: flex;
+      gap: 0;
+      background: #111;
+      border-bottom: 1px solid #222;
+    }
+    nav a {
+      padding: 10px 20px;
+      color: #888;
+      text-decoration: none;
+      font-size: 13px;
+      border-bottom: 2px solid transparent;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    nav a:hover { color: #ccc; }
+    nav a.active {
+      color: #fff;
+      border-bottom-color: #4f8eff;
+    }
+    nav .toggles {
+      margin-left: auto;
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      padding-right: 12px;
+    }
+    .toggle-wrap {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      color: #666;
+    }
+    .toggle-wrap.on { color: #4f8eff; }
+    .toggle-switch {
+      position: relative;
+      width: 32px;
+      height: 18px;
+      background: #333;
+      border-radius: 9px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .toggle-switch.on { background: #4f8eff; }
+    .toggle-switch::after {
+      content: "";
+      position: absolute;
+      top: 2px;
+      left: 2px;
+      width: 14px;
+      height: 14px;
+      background: #fff;
+      border-radius: 50%;
+      transition: transform 0.2s;
+    }
+    .toggle-switch.on::after { transform: translateX(14px); }
+    #waiting {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      color: #444;
+      font-size: 13px;
+    }
+    #api-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 8px;
+      padding: 8px;
+      width: 100%;
+      height: calc(100% - 10px);
+      align-content: start;
+    }
+    .participant-tile {
       position: relative;
       border-radius: 6px;
       overflow: hidden;
-      background: #16213e;
+      background: #111;
     }
-    .video-tile img {
+    .participant-tile img {
       width: 100%;
       display: block;
-      border-radius: 6px;
     }
-    .video-tile .name {
+    .participant-name {
       position: absolute;
       bottom: 0;
       left: 0;
       right: 0;
       padding: 4px 8px;
-      background: rgba(0,0,0,0.6);
+      background: rgba(0,0,0,0.7);
       font-size: 11px;
       color: #fff;
     }
-    .no-video {
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      height: 160px;
-      color: #555;
+    .no-feed {
+      color: #333;
       font-size: 12px;
+      padding: 20px;
+      text-align: center;
     }
-
-    #transcript {
-      padding: 10px;
-      background: #16213e;
-      border-radius: 6px;
-      height: 150px;
-      overflow-y: auto;
-      font-size: 12px;
-      line-height: 1.5;
-    }
-    .transcript-line { margin-bottom: 3px; }
-    .speaker { color: #e94560; font-weight: 600; }
   </style>
 </head>
 <body>
-  <h1>Recall.ai Desktop Recorder</h1>
-  <div id="status">Waiting for a meeting to start...</div>
-  <div id="meeting-info"></div>
-  <div class="controls">
-    <button id="btn-record" disabled>Start Recording</button>
-    <button id="btn-stop" disabled>Stop Recording</button>
-  </div>
-  <div id="video-grid">
-    <div class="no-video">No video feed yet — start recording to see participants</div>
-  </div>
-  <div id="transcript"></div>
+  <nav>
+    <a href="index.html" class="active">Desktop SDK</a>
+    <a href="bots.html">Bot Fleet</a>
+    <div class="toggles">
+      <div class="toggle-wrap" id="toggle-sdk-wrap">
+        <span>SDK</span>
+        <div class="toggle-switch" id="toggle-sdk"></div>
+      </div>
+      <div class="toggle-wrap" id="toggle-bot-wrap">
+        <span>Bots</span>
+        <div class="toggle-switch" id="toggle-bot"></div>
+      </div>
+    </div>
+  </nav>
+  <div id="waiting">Waiting for meeting...</div>
+  <div id="api-grid"></div>
   <script src="app.js"></script>
+  <script src="toggles.js"></script>
 </body>
 </html>

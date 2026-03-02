@@ -1,122 +1,58 @@
-console.log("[renderer] app.js loaded");
+const apiGrid = document.getElementById("api-grid");
+const waiting = document.getElementById("waiting");
 
-const status = document.getElementById("status");
-const meetingInfo = document.getElementById("meeting-info");
-const btnRecord = document.getElementById("btn-record");
-const btnStop = document.getElementById("btn-stop");
-const videoGrid = document.getElementById("video-grid");
-const transcript = document.getElementById("transcript");
+let frameCount = 0;
+let feedImg = null;
+let counterEl = null;
 
-let currentWindowId = null;
+function ensureFeed() {
+  if (feedImg) return;
 
-// Track video tiles per participant
-const videoTiles = new Map();
-
-function getOrCreateTile(participantId, participantName) {
-  if (videoTiles.has(participantId)) {
-    return videoTiles.get(participantId);
-  }
-
-  // Remove "no video" placeholder
-  const placeholder = videoGrid.querySelector(".no-video");
+  const placeholder = apiGrid.querySelector(".no-feed");
   if (placeholder) placeholder.remove();
+  waiting.style.display = "none";
 
-  const tile = document.createElement("div");
-  tile.className = "video-tile";
+  feedImg = document.createElement("img");
+  feedImg.style.width = "100%";
+  feedImg.style.display = "block";
+  feedImg.style.borderRadius = "6px";
+  apiGrid.appendChild(feedImg);
 
-  const img = document.createElement("img");
-  img.alt = participantName || "Participant";
-
-  const name = document.createElement("div");
-  name.className = "name";
-  name.textContent = participantName || "Participant " + (videoTiles.size + 1);
-
-  tile.appendChild(img);
-  tile.appendChild(name);
-  videoGrid.appendChild(tile);
-
-  const entry = { tile, img, name };
-  videoTiles.set(participantId, entry);
-  return entry;
+  counterEl = document.createElement("div");
+  counterEl.style.cssText = "color:#666;font-size:11px;padding:4px 8px;";
+  apiGrid.appendChild(counterEl);
 }
 
-if (!window.recallBridge) {
-  status.textContent = "ERROR: preload bridge not available";
-} else {
-  status.textContent = "Bridge OK — waiting for a meeting...";
-
+if (window.recallBridge) {
   window.recallBridge.onMeetingDetected((data) => {
-    console.log("[renderer] Meeting detected:", data);
-    currentWindowId = data.windowId;
-    status.textContent = "Meeting detected!";
-    meetingInfo.style.display = "block";
-    meetingInfo.textContent = data.title || "Meeting";
-    btnRecord.disabled = false;
-  });
+    console.log("[feed] Meeting:", data.platform);
+    waiting.textContent = "Meeting detected — starting recording...";
 
-  window.recallBridge.onSdkStateChange((data) => {
-    console.log("[renderer] SDK state:", data);
-  });
-
-  window.recallBridge.onRecordingEnded((data) => {
-    console.log("[renderer] Recording ended:", data);
-    status.textContent = "Recording ended: " + (data.reason || "stopped");
-    btnStop.disabled = true;
-    if (currentWindowId) {
-      btnRecord.disabled = false;
+    if (data.windowId) {
+      window.recallBridge.startRecording(data.windowId);
     }
   });
 
   window.recallBridge.onVideoFrame((frame) => {
-    // frame = { data: { buffer, timestamp }, video_separate: { id, participant }, recording, bot }
     const inner = frame.data || frame;
     const buffer = inner.buffer;
     if (!buffer) return;
 
-    const vs = frame.video_separate || {};
-    const participant = vs.participant || {};
-    const participantId = participant.id || vs.id || "unknown";
-    const participantName = participant.name || null;
+    const participant = inner.participant || {};
+    const name = participant.name || "Unknown";
 
-    const entry = getOrCreateTile(participantId, participantName);
-    entry.img.src = "data:image/png;base64," + buffer;
-
-    if (participantName && entry.name.textContent !== participantName) {
-      entry.name.textContent = participantName;
-    }
+    ensureFeed();
+    frameCount++;
+    feedImg.src = "data:image/png;base64," + buffer;
+    counterEl.textContent = "Frame #" + frameCount + " | " + name + " | " + new Date().toLocaleTimeString();
   });
 
-  window.recallBridge.onTranscriptData((data) => {
-    const line = document.createElement("div");
-    line.className = "transcript-line";
-    const speaker = data.speaker || "Unknown";
-    const text = data.text || data.transcript || JSON.stringify(data);
-    line.innerHTML = '<span class="speaker">' + speaker + ':</span> ' + text;
-    transcript.appendChild(line);
-    transcript.scrollTop = transcript.scrollHeight;
+  window.recallBridge.onRecordingEnded(() => {
+    feedImg = null;
+    counterEl = null;
+    frameCount = 0;
+    apiGrid.innerHTML = '<div class="no-feed">No data yet</div>';
+    waiting.style.display = "flex";
+    waiting.textContent = "Recording ended";
   });
 }
-
-btnRecord.addEventListener("click", async () => {
-  if (!currentWindowId) return;
-  btnRecord.disabled = true;
-  status.textContent = "Starting recording...";
-  const result = await window.recallBridge.startRecording(currentWindowId);
-  if (result.ok) {
-    status.textContent = "Recording in progress";
-    btnStop.disabled = false;
-  } else {
-    status.textContent = "Error: " + result.error;
-    btnRecord.disabled = false;
-  }
-});
-
-btnStop.addEventListener("click", async () => {
-  btnStop.disabled = true;
-  status.textContent = "Stopping...";
-  await window.recallBridge.stopRecording();
-  status.textContent = "Recording stopped";
-  if (currentWindowId) {
-    btnRecord.disabled = false;
-  }
-});
