@@ -3,3 +3,4 @@ dist
 .env
 out/
 node_modules/
+media/

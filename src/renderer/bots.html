@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream:; connect-src 'self' ws://localhost:3000;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream: http://localhost:8000; connect-src 'self' ws://localhost:3000 http://localhost:8000;" />
   <title>Recall.ai — Bot Fleet</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -437,6 +437,7 @@
     </div>
   </div>
 
+  <script src="hls.min.js"></script>
   <script src="bots.js"></script>
   <script src="toggles.js"></script>
 </body>

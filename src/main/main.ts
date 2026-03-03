@@ -352,6 +352,32 @@ app.whenReady().then(async () => {
     }
   });
 
+  // One-way frame push (legacy)
+  ipcMain.on("push-frame", (_event, b64Data: string) => {
+    if (!toggles.botFleet) return;
+    fetch(`${BACKEND_URL}/api/output-media/frame`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ b64_data: b64Data }),
+    }).catch(() => {});
+  });
+
+  // Stream raw webm chunks to server for HLS encoding (one-way, fire-and-forget)
+  ipcMain.on("stream-webm-chunk", (_event, chunk: any) => {
+    if (!toggles.botFleet) return;
+    // Ensure proper Buffer (IPC may serialize as Uint8Array)
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    fetch(`${BACKEND_URL}/api/output-media/stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/octet-stream" },
+      body: buf,
+    }).catch(() => {});
+  });
+
+  ipcMain.on("stream-stop", () => {
+    fetch(`${BACKEND_URL}/api/output-media/stream-stop`, { method: "POST" }).catch(() => {});
+  });
+
   ipcMain.handle("send-audio-to-bot", async (_event, botId: string, b64Data: string) => {
     if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
     try {

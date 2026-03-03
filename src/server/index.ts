@@ -6,6 +6,7 @@ import { writeFile, unlink, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
+import NodeMediaServer from "node-media-server";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -39,6 +40,7 @@ interface BotRecord {
 }
 
 const bots = new Map<string, BotRecord>();
+let botCounter = 0; // Global counter for unique bot IDs across deploys
 
 // 1-pixel silent JPEG for enabling automatic_video_output (API fallback)
 const SILENT_JPEG =
@@ -48,31 +50,78 @@ const SILENT_JPEG =
 const SILENT_MP3 =
   "//uQxAAAAAANIAAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV";
 
-// ── ngrok auto-detection ─────────────────────────────────────────────
+// ── Tunnel management (ngrok + cloudflared) ─────────────────────────
 
-let ngrokUrl: string | null = null;
+let ngrokTcpUrl: string | null = null; // for RTMP streaming
+let tunnelHttpUrl: string | null = null; // for output media (cloudflared)
 
-async function detectNgrokUrl(): Promise<string | null> {
+import { spawn } from "node:child_process";
+
+function startCloudflared(): Promise<string | null> {
+  return new Promise((resolve) => {
+    const cf = spawn("cloudflared", ["tunnel", "--url", `http://localhost:${PORT}`], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+
+    let resolved = false;
+    const timeout = setTimeout(() => {
+      if (!resolved) { resolved = true; resolve(null); }
+    }, 15000);
+
+    function parseLine(line: string) {
+      const match = line.match(/(https:\/\/[^\s]*\.trycloudflare\.com)/);
+      if (match && !resolved) {
+        resolved = true;
+        clearTimeout(timeout);
+        tunnelHttpUrl = match[1];
+        console.log(`[cloudflared] Tunnel ready: ${tunnelHttpUrl}`);
+        resolve(tunnelHttpUrl);
+      }
+    }
+
+    cf.stdout.on("data", (d: Buffer) => d.toString().split("\n").forEach(parseLine));
+    cf.stderr.on("data", (d: Buffer) => d.toString().split("\n").forEach(parseLine));
+
+    cf.on("exit", (code) => {
+      console.log(`[cloudflared] Process exited (code ${code})`);
+      tunnelHttpUrl = null;
+    });
+  });
+}
+
+async function detectTunnels(): Promise<void> {
+  // Detect ngrok tunnels (for RTMP TCP)
   try {
     const res = await fetch("http://127.0.0.1:4040/api/tunnels");
     const data = await res.json();
-    const httpsTunnel = (data.tunnels as any[])?.find(
-      (t: any) => t.proto === "https"
-    );
-    if (httpsTunnel) {
-      ngrokUrl = httpsTunnel.public_url;
-      console.log(`[server] Detected ngrok URL: ${ngrokUrl}`);
-      return ngrokUrl;
+    const tunnels = (data.tunnels as any[]) || [];
+
+    const tcpTunnel = tunnels.find((t: any) => t.proto === "tcp");
+    if (tcpTunnel) {
+      ngrokTcpUrl = tcpTunnel.public_url;
+      console.log(`[server] Detected ngrok TCP: ${ngrokTcpUrl}`);
+    } else {
+      ngrokTcpUrl = null;
     }
   } catch {
-    console.log("[server] ngrok not running — using output_video API fallback");
+    ngrokTcpUrl = null;
   }
-  return null;
+
+  // Use env var if provided, otherwise cloudflared is started automatically
+  if (process.env.CLOUDFLARED_URL) {
+    tunnelHttpUrl = process.env.CLOUDFLARED_URL;
+    console.log(`[server] Using cloudflared (env): ${tunnelHttpUrl}`);
+  }
 }
 
 app.get("/api/ngrok-status", async (_req, res) => {
-  const url = await detectNgrokUrl();
-  res.json({ available: !!url, url });
+  await detectTunnels();
+  res.json({
+    available: !!tunnelHttpUrl,
+    url: tunnelHttpUrl,
+    rtmpAvailable: !!ngrokTcpUrl,
+    rtmpUrl: ngrokTcpUrl,
+  });
 });
 
 // ── WebSocket server for Output Media pages ─────────────────────────
@@ -87,8 +136,15 @@ wssPush.on("connection", (ws) => {
   console.log("[ws] Frame push client connected (renderer)");
 
   ws.on("message", (data: Buffer) => {
-    // Received binary JPEG frame from renderer — broadcast to all output media pages
+    // Received binary JPEG frame from renderer
     lastFrame = data;
+    latestFrameB64 = data.toString("base64");
+    latestFrameVersion++;
+
+    // Push to SSE clients (bot's headless browser) — instant delivery
+    pushFrameToSSE(latestFrameB64);
+
+    // Push to WebSocket clients
     for (const [, clients] of outputMediaClients) {
       for (const client of clients) {
         if (client.readyState === WebSocket.OPEN) {
@@ -133,6 +189,10 @@ wss.on("connection", (ws, req) => {
 // Last frame buffer for new connections
 let lastFrame: Buffer | null = null;
 
+// Frame store for HTTP polling (output media page)
+let latestFrameB64: string | null = null;
+let latestFrameVersion = 0;
+
 function broadcastToOutputMediaPages(frame: Buffer) {
   lastFrame = frame;
   for (const [, clients] of outputMediaClients) {
@@ -154,62 +214,54 @@ function getConnectedClientCount(): number {
 
 // ── Output Media HTML page (rendered by bot's headless browser) ─────
 
+// Uses Server-Sent Events (SSE) for instant frame delivery — no polling delay
+// Output media page: plays HLS stream (smooth 30fps video via real encoding)
 const OUTPUT_MEDIA_HTML = `<!DOCTYPE html>
 <html><head>
 <meta charset="UTF-8">
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
 <style>
   * { margin: 0; padding: 0; }
   body { width: 1280px; height: 720px; overflow: hidden; background: #000; }
-  canvas { display: block; }
+  video { width: 1280px; height: 720px; object-fit: cover; }
 </style>
 </head><body>
-<canvas id="c" width="1280" height="720"></canvas>
+<video id="v" muted autoplay playsinline></video>
 <script>
-const canvas = document.getElementById('c');
-const ctx = canvas.getContext('2d');
-const params = new URLSearchParams(location.search);
-const botId = params.get('bot') || 'unknown';
+const video = document.getElementById('v');
+const hlsUrl = '/hls/webcam/index.m3u8';
 
-let ws;
-let reconnectDelay = 1000;
-
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws/output-media?bot=' + botId);
-  ws.binaryType = 'arraybuffer';
-
-  ws.onopen = () => {
-    console.log('[output-media] Connected');
-    reconnectDelay = 1000;
-  };
-
-  ws.onmessage = async (evt) => {
-    if (evt.data instanceof ArrayBuffer) {
-      const blob = new Blob([evt.data], { type: 'image/jpeg' });
-      const bmp = await createImageBitmap(blob);
-      ctx.drawImage(bmp, 0, 0, 1280, 720);
-      bmp.close();
-    } else {
-      try {
-        const cmd = JSON.parse(evt.data);
-        if (cmd.type === 'clear') {
-          ctx.fillStyle = '#000';
-          ctx.fillRect(0, 0, 1280, 720);
-        }
-      } catch {}
-    }
-  };
-
-  ws.onclose = () => {
-    console.log('[output-media] Disconnected, reconnecting in ' + reconnectDelay + 'ms');
-    setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
-  };
-
-  ws.onerror = () => ws.close();
+function startHls() {
+  if (typeof Hls !== 'undefined' && Hls.isSupported()) {
+    const hls = new Hls({
+      liveSyncDurationCount: 1,
+      liveMaxLatencyDurationCount: 2,
+      maxBufferLength: 2,
+      enableWorker: true,
+    });
+    hls.loadSource(hlsUrl);
+    hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      if (data.fatal) {
+        setTimeout(() => { hls.destroy(); startHls(); }, 2000);
+      }
+    });
+  } else {
+    // Fallback: native HLS (Safari)
+    video.src = hlsUrl;
+    video.play();
+  }
 }
 
-connect();
+// Wait for HLS stream to be available
+function tryStart() {
+  fetch(hlsUrl).then(r => {
+    if (r.ok) startHls();
+    else setTimeout(tryStart, 1000);
+  }).catch(() => setTimeout(tryStart, 1000));
+}
+tryStart();
 </script>
 </body></html>`;
 
@@ -217,7 +269,127 @@ app.get("/output-media", (_req, res) => {
   res.type("html").send(OUTPUT_MEDIA_HTML);
 });
 
-// ── Output Media frame push endpoint ────────────────────────────────
+// ── Live HLS encoding from webcam ───────────────────────────────────
+
+import { mkdirSync, existsSync } from "node:fs";
+
+const HLS_DIR = path.join(process.cwd(), "media", "webcam");
+if (!existsSync(HLS_DIR)) mkdirSync(HLS_DIR, { recursive: true });
+
+// Serve HLS segments
+app.use("/hls/webcam", express.static(HLS_DIR, {
+  setHeaders: (res) => {
+    res.set("Cache-Control", "no-cache, no-store");
+    res.set("Access-Control-Allow-Origin", "*");
+  },
+}));
+
+// ffmpeg process for live encoding
+let ffmpegProc: ReturnType<typeof spawn> | null = null;
+
+function startFfmpegHls() {
+  if (ffmpegProc) return;
+
+  // Clean old segments
+  const files = require("node:fs").readdirSync(HLS_DIR);
+  for (const f of files) {
+    require("node:fs").unlinkSync(path.join(HLS_DIR, f));
+  }
+
+  ffmpegProc = spawn("/opt/homebrew/bin/ffmpeg", [
+    "-f", "webm",
+    "-i", "pipe:0",           // Read webm from stdin
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-tune", "zerolatency",
+    "-g", "30",               // Keyframe every 30 frames
+    "-sc_threshold", "0",
+    "-b:v", "1500k",
+    "-maxrate", "1500k",
+    "-bufsize", "3000k",
+    "-s", "1280x720",
+    "-r", "30",
+    "-f", "hls",
+    "-hls_time", "1",         // 1-second segments
+    "-hls_list_size", "3",
+    "-hls_flags", "delete_segments+append_list",
+    "-hls_segment_filename", path.join(HLS_DIR, "seg%03d.ts"),
+    path.join(HLS_DIR, "index.m3u8"),
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+
+  ffmpegProc.stderr?.on("data", (d: Buffer) => {
+    const msg = d.toString().trim();
+    if (msg) console.log(`[ffmpeg] ${msg}`);
+  });
+
+  ffmpegProc.on("exit", (code) => {
+    console.log(`[ffmpeg] HLS encoder exited (code ${code})`);
+    ffmpegProc = null;
+  });
+
+  console.log("[ffmpeg] HLS encoder started (1s segments, 1280x720, 30fps)");
+}
+
+function stopFfmpegHls() {
+  if (ffmpegProc) {
+    ffmpegProc.stdin?.end();
+    ffmpegProc.kill();
+    ffmpegProc = null;
+    console.log("[ffmpeg] HLS encoder stopped");
+  }
+}
+
+// Receive webm video chunks from renderer and pipe to ffmpeg
+app.post("/api/output-media/stream", express.raw({ type: "*/*", limit: "5mb" }), (req, res) => {
+  if (!ffmpegProc) startFfmpegHls();
+
+  try {
+    if (ffmpegProc?.stdin?.writable) {
+      ffmpegProc.stdin.write(req.body);
+    }
+  } catch {}
+
+  res.json({ ok: true });
+});
+
+app.post("/api/output-media/stream-stop", (_req, res) => {
+  stopFfmpegHls();
+  res.json({ ok: true });
+});
+
+// ── Output Media SSE + frame endpoints ──────────────────────────────
+
+// SSE clients (bot's headless browser connects here for instant frame push)
+const sseClients = new Set<any>();
+
+app.get("/api/output-media/sse", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+    "ngrok-skip-browser-warning": "true",
+  });
+  res.write("\n");
+  sseClients.add(res);
+  console.log(`[sse] Output media client connected (${sseClients.size} total)`);
+
+  // Send current frame immediately if one exists
+  if (latestFrameB64) {
+    res.write(`data: ${latestFrameB64}\n\n`);
+  }
+
+  req.on("close", () => {
+    sseClients.delete(res);
+    console.log(`[sse] Output media client disconnected (${sseClients.size} total)`);
+  });
+});
+
+function pushFrameToSSE(b64: string) {
+  const msg = `data: ${b64}\n\n`;
+  for (const client of sseClients) {
+    client.write(msg);
+  }
+}
 
 app.post("/api/output-media/frame", (req, res) => {
   const { b64_data } = req.body;
@@ -226,10 +398,24 @@ app.post("/api/output-media/frame", (req, res) => {
     return;
   }
 
+  latestFrameB64 = b64_data;
+  latestFrameVersion++;
+
+  // Push to SSE clients (bot's headless browser) — instant delivery
+  pushFrameToSSE(b64_data);
+
+  // Also push via WebSocket for local renderer preview
   const frame = Buffer.from(b64_data, "base64");
   broadcastToOutputMediaPages(frame);
 
-  res.json({ ok: true, clients: getConnectedClientCount() });
+  res.json({ ok: true, version: latestFrameVersion, sseClients: sseClients.size });
+});
+
+app.get("/api/output-media/latest", (_req, res) => {
+  res.json({
+    version: latestFrameVersion,
+    b64_data: latestFrameB64,
+  });
 });
 
 // ── Desktop SDK Endpoints ────────────────────────────────────────────
@@ -377,15 +563,29 @@ app.post("/api/bots/deploy", async (req, res) => {
     return;
   }
 
-  // Re-detect ngrok URL before deploying
-  await detectNgrokUrl();
+  // Re-detect all tunnels before deploying
+  await detectTunnels();
+
+  // Remove any existing bots from calls before deploying new ones
+  for (const bot of bots.values()) {
+    if (!["done", "fatal", "leaving"].includes(bot.status)) {
+      try {
+        await fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/leave_call/`, {
+          method: "POST", headers: { Authorization: `Token ${API_KEY}` },
+        });
+      } catch {}
+    }
+  }
+  bots.clear();
+  botCounter = 0;
 
   const count = Math.min(Math.max(1, bot_count), 10);
   const created: BotRecord[] = [];
   const errors: { index: number; error: string }[] = [];
 
   for (let i = 1; i <= count; i++) {
-    const localId = `bot-${i}`;
+    botCounter++;
+    const localId = `bot-${botCounter}`;
 
     const botPayload: any = {
       meeting_url,
@@ -400,35 +600,40 @@ app.post("/api/bots/deploy", async (req, res) => {
       },
     };
 
-    if (ngrokUrl) {
-      // Webpage mode: bot renders our page as its camera at 30fps
+    // RTMP streaming: receive live 720p/30fps video from the meeting
+    if (ngrokTcpUrl) {
+      // Convert tcp://host:port to rtmp://host:port/live/bot-{i}
+      const rtmpUrl = ngrokTcpUrl.replace("tcp://", "rtmp://") + `/live/${localId}`;
+      botPayload.recording_config.video_mixed_flv = {};
+      botPayload.recording_config.realtime_endpoints = [
+        {
+          type: "rtmp",
+          url: rtmpUrl,
+          events: ["video_mixed_flv.data"],
+        },
+      ];
+      console.log(`[bot] ${localId} RTMP stream → ${rtmpUrl}`);
+    }
+
+    // Output media webpage (30fps via cloudflared)
+    if (tunnelHttpUrl) {
       botPayload.output_media = {
         camera: {
           kind: "webpage",
           config: {
-            url: `${ngrokUrl}/output-media?bot=${localId}&ngrok-skip-browser-warning=true`,
+            url: `${tunnelHttpUrl}/output-media?bot=${localId}`,
           },
         },
       };
-      // Audio output still via API
-      botPayload.automatic_audio_output = {
-        in_call_recording: {
-          data: { kind: "mp3" as const, b64_data: SILENT_MP3 },
-        },
-      };
-      console.log(`[bot] ${localId} using webpage mode: ${ngrokUrl}/output-media?bot=${localId}`);
+      console.log(`[bot] ${localId} camera: webpage via ${tunnelHttpUrl}`);
     } else {
-      // Fallback: output_video API (rate-limited 5fps)
-      botPayload.automatic_video_output = {
-        in_call_recording: { kind: "jpeg" as const, b64_data: SILENT_JPEG },
-      };
-      botPayload.automatic_audio_output = {
-        in_call_recording: {
-          data: { kind: "mp3" as const, b64_data: SILENT_MP3 },
-        },
-      };
-      console.log(`[bot] ${localId} using API fallback mode (no ngrok)`);
+      console.log(`[bot] ${localId} WARNING: no tunnel — bot camera will be black`);
     }
+    botPayload.automatic_audio_output = {
+      in_call_recording: {
+        data: { kind: "mp3" as const, b64_data: SILENT_MP3 },
+      },
+    };
 
     try {
       const response = await fetch(`${BASE_URL}/api/v1/bot/`, {
@@ -469,7 +674,7 @@ app.post("/api/bots/deploy", async (req, res) => {
     }
   }
 
-  res.json({ created, errors, mode: ngrokUrl ? "webpage" : "api" });
+  res.json({ created, errors, mode: tunnelHttpUrl ? "webpage" : "api" });
 });
 
 app.get("/api/bots", async (_req, res) => {
@@ -650,15 +855,19 @@ app.post("/api/bots/:id/send-image", async (req, res) => {
     return;
   }
 
-  // If webpage mode, push via WebSocket
-  if (ngrokUrl && getConnectedClientCount() > 0) {
-    const frame = Buffer.from(b64_data, "base64");
-    broadcastToOutputMediaPages(frame);
-    res.json({ ok: true, mode: "webpage" });
-    return;
-  }
+  // Push to SSE (output_media webpage renders it as bot's camera)
+  pushFrameToSSE(b64_data);
+  latestFrameB64 = b64_data;
+  latestFrameVersion++;
+  res.json({ ok: true, sseClients: sseClients.size });
+});
 
-  // Fallback: output_video API
+// Keep old output_video route for backwards compat but unused
+app.post("/api/bots/:id/send-image-api", async (req, res) => {
+  const bot = bots.get(req.params.id);
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
+  const { b64_data } = req.body;
+  if (!b64_data) { res.status(400).json({ error: "b64_data is required" }); return; }
   try {
     const response = await fetch(
       `${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`,
@@ -692,37 +901,12 @@ app.post("/api/bots/broadcast-image", async (req, res) => {
     return;
   }
 
-  // If webpage mode, push via WebSocket (instant, no rate limit)
-  if (ngrokUrl && getConnectedClientCount() > 0) {
-    const frame = Buffer.from(b64_data, "base64");
-    broadcastToOutputMediaPages(frame);
-    res.json({ ok: true, sent: getConnectedClientCount(), failed: 0, mode: "webpage" });
-    return;
-  }
+  // Push to SSE — all bot output_media pages receive this instantly
+  pushFrameToSSE(b64_data);
+  latestFrameB64 = b64_data;
+  latestFrameVersion++;
 
-  // Fallback: output_video API (rate-limited)
-  const activeBotList = Array.from(bots.values()).filter(
-    (b) => !["done", "fatal", "leaving"].includes(b.status)
-  );
-
-  const body = JSON.stringify({ kind: "jpeg", b64_data });
-  const results = await Promise.allSettled(
-    activeBotList.map((bot) =>
-      fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`, {
-        method: "POST",
-        headers: {
-          Authorization: `Token ${API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body,
-      }).then((r) => r.ok)
-    )
-  );
-
-  const sent = results.filter((r) => r.status === "fulfilled" && r.value).length;
-  const failed = results.length - sent;
-
-  res.json({ ok: true, sent, failed, mode: "api" });
+  res.json({ ok: true, sseClients: sseClients.size, mode: "webpage" });
 });
 
 app.post("/api/bots/:id/send-audio", async (req, res) => {
@@ -945,17 +1129,111 @@ app.get("/api/upload-status/:id", async (req, res) => {
   }
 });
 
-// ── Start server ─────────────────────────────────────────────────────
+// ── RTMP ingest server (node-media-server) ──────────────────────────
 
-server.listen(PORT, () => {
+const nms = new NodeMediaServer({
+  rtmp: {
+    port: 1935,
+    chunk_size: 60000,
+    gop_cache: true,
+    ping: 30,
+    ping_timeout: 60,
+  },
+  http: {
+    port: 8000,
+    mediaroot: "./media",
+    allow_origin: "*",
+  },
+  trans: {
+    ffmpeg: "/opt/homebrew/bin/ffmpeg",
+    tasks: [
+      {
+        app: "live",
+        hls: 1,
+        hlsFlags: "[hls_time=2:hls_list_size=3:hls_flags=delete_segments]",
+      },
+    ],
+  },
+});
+
+nms.on("prePublish", (_id: string, StreamPath: string) => {
+  console.log(`[rtmp] Stream started: ${StreamPath}`);
+});
+
+nms.on("donePublish", (_id: string, StreamPath: string) => {
+  console.log(`[rtmp] Stream ended: ${StreamPath}`);
+});
+
+// ── Start servers ────────────────────────────────────────────────────
+
+// ── Force remove all active bots (used on startup and shutdown) ─────
+
+async function forceRemoveAllBots() {
+  const statuses = ["joining_call", "in_waiting_room", "in_call_not_recording", "in_call_recording", "recording_permission_allowed"];
+  let total = 0;
+  for (const s of statuses) {
+    try {
+      const listRes = await fetch(`${BASE_URL}/api/v1/bot/?status_code=${s}&limit=100`, {
+        headers: { Authorization: `Token ${API_KEY}` },
+      });
+      if (!listRes.ok) continue;
+      const data = await listRes.json();
+      for (const bot of (data.results || [])) {
+        try {
+          await fetch(`${BASE_URL}/api/v1/bot/${bot.id}/leave_call/`, {
+            method: "POST", headers: { Authorization: `Token ${API_KEY}` },
+          });
+          total++;
+        } catch {}
+      }
+    } catch {}
+  }
+  bots.clear();
+  return total;
+}
+
+// ── Cleanup on shutdown ─────────────────────────────────────────────
+
+async function cleanup() {
+  console.log("[server] Shutting down — removing all bots...");
+  const removed = await forceRemoveAllBots();
+  console.log(`[server] Removed ${removed} bots on shutdown`);
+  process.exit(0);
+}
+
+process.on("SIGINT", cleanup);
+process.on("SIGTERM", cleanup);
+
+// ── Start server ────────────────────────────────────────────────────
+
+server.listen(PORT, async () => {
   console.log(`[server] Backend running on http://localhost:${PORT}`);
-  detectNgrokUrl().then((url) => {
-    if (url) {
-      console.log(`[server] Output Media Webpage mode: ${url}/output-media`);
-      console.log(`[server] Bots will render page at 30fps — no rate limit`);
-    } else {
-      console.log(`[server] Fallback mode: output_video API (5fps max)`);
-      console.log(`[server] Start ngrok for 30fps: ngrok http 3000`);
+
+  // Don't auto-cleanup on startup (too slow, kills newly deployed bots)
+
+  // Start RTMP server
+  nms.run();
+  console.log(`[rtmp] RTMP ingest on rtmp://localhost:1935`);
+  console.log(`[rtmp] HLS playback on http://localhost:8000/live/{stream}/index.m3u8`);
+
+  // Auto-start cloudflared for output media (no interstitial)
+  if (!process.env.CLOUDFLARED_URL) {
+    console.log(`[server] Starting cloudflared tunnel...`);
+    startCloudflared().then((url) => {
+      if (url) {
+        console.log(`[server] Output Media (30fps): ${url}/output-media`);
+      } else {
+        console.log(`[server] cloudflared failed — bot camera disabled`);
+      }
+    });
+  } else {
+    console.log(`[server] Output Media (30fps): ${tunnelHttpUrl}/output-media`);
+  }
+
+  // Detect ngrok for RTMP
+  detectTunnels().then(() => {
+    if (ngrokTcpUrl) {
+      console.log(`[server] RTMP via ngrok: ${ngrokTcpUrl.replace("tcp://", "rtmp://")}/live/{bot-id}`);
     }
   });
 });

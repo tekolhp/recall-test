@@ -50,18 +50,17 @@ let pushSocket = null; // Direct WebSocket to server for frame pushing
 
 const bridge = window.recallBridge;
 
-// ── Check ngrok / output media status ────────────────────────────────
+// ── Check tunnel status ──────────────────────────────────────────────
 async function checkNgrokStatus() {
   try {
     const status = await bridge.getNgrokStatus();
     outputMediaMode = status.available;
-    if (outputMediaMode && !pushSocket) {
-      connectPushSocket();
-    }
     updateStreamInfo();
   } catch {
     outputMediaMode = false;
   }
+  // Always connect push socket for direct frame delivery
+  if (!pushSocket) connectPushSocket();
 }
 
 function connectPushSocket() {
@@ -375,6 +374,9 @@ function renderBots() {
   }
 }
 
+// Track HLS players per bot for cleanup
+const hlsPlayers = new Map();
+
 function createBotTile(bot) {
   const tile = document.createElement("div");
   tile.className = "bot-tile";
@@ -386,8 +388,9 @@ function createBotTile(bot) {
       <span class="bot-tile-status ${bot.status}">${formatStatus(bot.status)}</span>
     </div>
     <div class="bot-tile-preview" id="preview-${bot.id}">
+      <video id="hls-${bot.id}" muted autoplay playsinline style="width:100%;height:100%;object-fit:contain;display:none;"></video>
       <img />
-      <span>No image sent yet</span>
+      <span>Waiting for stream...</span>
     </div>
     <div class="bot-tile-transcript" id="transcript-${bot.id}"></div>
     <div class="bot-tile-actions">
@@ -404,6 +407,7 @@ function createBotTile(bot) {
 
   tile.querySelector(".btn-kick").addEventListener("click", async () => {
     try {
+      destroyHlsPlayer(bot.id);
       await bridge.removeBot(bot.id);
       statusBar.textContent = `Removed ${bot.id}`;
     } catch (err) {
@@ -412,6 +416,51 @@ function createBotTile(bot) {
   });
 
   return tile;
+}
+
+function tryStartHlsPlayer(botId) {
+  if (hlsPlayers.has(botId)) return; // already running
+  if (typeof Hls === "undefined" || !Hls.isSupported()) return;
+
+  const videoEl = document.getElementById(`hls-${botId}`);
+  if (!videoEl) return;
+
+  const hlsUrl = `http://localhost:8000/live/${botId}/index.m3u8`;
+  const hls = new Hls({
+    liveSyncDurationCount: 1,
+    liveMaxLatencyDurationCount: 3,
+    enableWorker: true,
+  });
+
+  hls.loadSource(hlsUrl);
+  hls.attachMedia(videoEl);
+
+  hls.on(Hls.Events.MANIFEST_PARSED, () => {
+    videoEl.style.display = "block";
+    const placeholder = videoEl.parentElement?.querySelector("span");
+    if (placeholder) placeholder.style.display = "none";
+    videoEl.play().catch(() => {});
+    console.log(`[hls] Playing stream for ${botId}`);
+  });
+
+  hls.on(Hls.Events.ERROR, (_event, data) => {
+    if (data.fatal) {
+      // Stream not ready yet — retry in 3s
+      hls.destroy();
+      hlsPlayers.delete(botId);
+      setTimeout(() => tryStartHlsPlayer(botId), 3000);
+    }
+  });
+
+  hlsPlayers.set(botId, hls);
+}
+
+function destroyHlsPlayer(botId) {
+  const hls = hlsPlayers.get(botId);
+  if (hls) {
+    hls.destroy();
+    hlsPlayers.delete(botId);
+  }
 }
 
 function updateBotTile(tile, bot) {
@@ -423,6 +472,17 @@ function updateBotTile(tile, bot) {
   nameEl.textContent = bot.breakoutRoom
     ? `${bot.name} — ${bot.breakoutRoom}`
     : bot.name;
+
+  // Start HLS player when bot is recording (RTMP stream should be active)
+  const recordingStatuses = ["in_call_recording", "recording_permission_allowed", "in_breakout_room"];
+  if (recordingStatuses.includes(bot.status)) {
+    tryStartHlsPlayer(bot.id);
+  }
+
+  // Cleanup player when bot is done
+  if (["done", "fatal"].includes(bot.status)) {
+    destroyHlsPlayer(bot.id);
+  }
 }
 
 function formatStatus(status) {
@@ -513,7 +573,9 @@ async function updateTranscript(botId) {
   }
 }
 
-// ── Real-time Video Streaming ─────────────────────────────────────────
+// ── Real-time Video Streaming (HLS via MediaRecorder) ────────────────
+
+let videoRecorder = null;
 
 btnStartVideo.addEventListener("click", async () => {
   const source = videoSourceSelect.value;
@@ -525,25 +587,23 @@ btnStartVideo.addEventListener("click", async () => {
   try {
     if (source === "camera") {
       videoStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1920 }, height: { ideal: 1080 } },
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
         audio: false,
       });
     } else if (source === "screen") {
-      // Electron desktopCapturer — get sources via IPC, then getUserMedia
       const sources = await bridge.getSources();
       if (sources.length === 0) {
         statusBar.textContent = "No screen sources available";
         return;
       }
-      // Use the first screen source
       const screenSource = sources.find((s) => s.name === "Entire Screen") || sources[0];
       videoStream = await navigator.mediaDevices.getUserMedia({
         video: {
           mandatory: {
             chromeMediaSource: "desktop",
             chromeMediaSourceId: screenSource.id,
-            maxWidth: 1920,
-            maxHeight: 1080,
+            maxWidth: 1280,
+            maxHeight: 720,
           },
         },
         audio: false,
@@ -555,16 +615,16 @@ btnStartVideo.addEventListener("click", async () => {
     btnStopVideo.style.display = "";
     videoSourceSelect.disabled = true;
 
-    // Calculate fps: 300 req/min total, divided across active bots
-    startFrameSending();
-    statusBar.textContent = "Video streaming started";
+    // Start MediaRecorder → webm chunks → server → ffmpeg → HLS
+    startVideoRecorder();
+    statusBar.textContent = "Video streaming (HLS encoding)";
   } catch (err) {
     statusBar.textContent = `Failed to start video: ${err.message}`;
   }
 });
 
 btnStopVideo.addEventListener("click", () => {
-  stopFrameSending();
+  stopVideoRecorder();
   if (videoStream) {
     videoStream.getTracks().forEach((t) => t.stop());
     videoStream = null;
@@ -573,83 +633,43 @@ btnStopVideo.addEventListener("click", () => {
   btnStartVideo.style.display = "";
   btnStopVideo.style.display = "none";
   videoSourceSelect.disabled = false;
+  bridge.streamStop();
   statusBar.textContent = "Video streaming stopped";
 });
 
-function startFrameSending() {
-  if (videoFrameInterval) return;
+function startVideoRecorder() {
+  if (videoRecorder || !videoStream) return;
 
+  // Use VP8 webm — ffmpeg can decode this for HLS
+  const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
+    ? "video/webm;codecs=vp8"
+    : "video/webm";
+
+  videoRecorder = new MediaRecorder(videoStream, {
+    mimeType,
+    videoBitsPerSecond: 2000000, // 2 Mbps
+  });
+
+  videoRecorder.ondataavailable = async (e) => {
+    if (e.data.size === 0) return;
+    const buffer = await e.data.arrayBuffer();
+    bridge.streamWebmChunk(buffer);
+    framesSent++;
+    if (framesSent % 10 === 0) updateStreamInfo();
+  };
+
+  // Send chunks every 200ms (small chunks = low latency)
+  videoRecorder.start(200);
   framesSent = 0;
-  framesErrors = 0;
-  const ctx = streamCanvas.getContext("2d");
-
-  function getIntervalMs() {
-    if (outputMediaMode) {
-      // Webpage mode: ~30fps (no rate limit, frames go via WebSocket)
-      return 33;
-    }
-    // API mode: rate-limited at 300 req/min
-    const activeBotCount = activeBots.filter(
-      (b) => !["done", "fatal", "leaving"].includes(b.status)
-    ).length;
-    const n = Math.max(activeBotCount, 1);
-    return n * 200;
-  }
-
-  async function sendFrame() {
-    if (isSendingFrame || !videoStream) return;
-    isSendingFrame = true;
-
-    try {
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = "high";
-      ctx.drawImage(streamVideo, 0, 0, 1280, 720);
-
-      if (outputMediaMode && pushSocket && pushSocket.readyState === WebSocket.OPEN) {
-        // Direct WebSocket: send binary JPEG (no base64, no IPC, no HTTP)
-        streamCanvas.toBlob((blob) => {
-          if (blob && pushSocket && pushSocket.readyState === WebSocket.OPEN) {
-            blob.arrayBuffer().then((buf) => {
-              pushSocket.send(buf);
-              framesSent++;
-              updateStreamInfo();
-            });
-          }
-          isSendingFrame = false;
-
-          if (videoFrameInterval !== null) {
-            videoFrameInterval = setTimeout(sendFrame, getIntervalMs());
-          }
-        }, "image/jpeg", 0.85);
-        return; // toBlob is async, the callback handles the rest
-      } else {
-        // Fallback: broadcast via output_video API (rate-limited)
-        const jpegDataUrl = streamCanvas.toDataURL("image/jpeg", 0.80);
-        const b64 = jpegDataUrl.split(",")[1];
-        await bridge.broadcastImage(b64);
-        framesSent++;
-        updateStreamInfo();
-      }
-    } catch {
-      framesErrors++;
-    } finally {
-      isSendingFrame = false;
-    }
-
-    if (videoFrameInterval !== null) {
-      videoFrameInterval = setTimeout(sendFrame, getIntervalMs());
-    }
-  }
-
-  videoFrameInterval = setTimeout(sendFrame, 100);
+  console.log("[stream] MediaRecorder started:", mimeType);
+  updateStreamInfo();
 }
 
-function stopFrameSending() {
-  if (videoFrameInterval) {
-    clearTimeout(videoFrameInterval);
-    videoFrameInterval = null;
+function stopVideoRecorder() {
+  if (videoRecorder) {
+    videoRecorder.stop();
+    videoRecorder = null;
   }
-  isSendingFrame = false;
   updateStreamInfo();
 }
 

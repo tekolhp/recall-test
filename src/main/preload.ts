@@ -43,6 +43,14 @@ contextBridge.exposeInMainWorld("recallBridge", {
     ipcRenderer.invoke("send-image-to-bot", botId, b64Data),
   broadcastImage: (b64Data: string) =>
     ipcRenderer.invoke("broadcast-image", b64Data),
+  // One-way fire-and-forget for streaming (no IPC round-trip)
+  pushFrame: (b64Data: string) =>
+    ipcRenderer.send("push-frame", b64Data),
+  // Stream raw webm video chunks for HLS encoding
+  streamWebmChunk: (chunk: ArrayBuffer) =>
+    ipcRenderer.send("stream-webm-chunk", Buffer.from(chunk)),
+  streamStop: () =>
+    ipcRenderer.send("stream-stop"),
   sendAudioToBot: (botId: string, b64Data: string) =>
     ipcRenderer.invoke("send-audio-to-bot", botId, b64Data),
   sendAudioWebmToBot: (botId: string, b64Data: string) =>
