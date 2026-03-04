@@ -48,6 +48,14 @@ const indUrl = document.getElementById("ind-url");
 const toggleAudio = document.getElementById("toggle-audio");
 const indAudio = document.getElementById("ind-audio");
 
+// Settings modal
+const btnSettings = document.getElementById("btn-settings");
+const settingsModal = document.getElementById("settings-modal");
+const settingsProvider = document.getElementById("settings-provider");
+const deepgramHint = document.getElementById("deepgram-hint");
+const settingsCancel = document.getElementById("settings-cancel");
+const settingsSave = document.getElementById("settings-save");
+
 let activeBots = [];
 let pollInterval = null;
 let modalTargetBotId = null; // null = broadcast
@@ -1368,3 +1376,33 @@ toggleAudio.addEventListener("click", async () => {
     }
   }
 })();
+
+// ── Settings Modal ─────────────────────────────────────────────────────
+
+function updateDeepgramHint() {
+  deepgramHint.style.display = settingsProvider.value === "deepgram" ? "block" : "none";
+}
+
+settingsProvider.addEventListener("change", updateDeepgramHint);
+
+btnSettings.addEventListener("click", async () => {
+  const settings = await window.recallBridge.getAppSettings();
+  settingsProvider.value = settings.transcriptionProvider || "recallai";
+  updateDeepgramHint();
+  settingsModal.classList.add("active");
+});
+
+settingsCancel.addEventListener("click", () => {
+  settingsModal.classList.remove("active");
+});
+
+settingsModal.addEventListener("click", (e) => {
+  if (e.target === settingsModal) settingsModal.classList.remove("active");
+});
+
+settingsSave.addEventListener("click", async () => {
+  await window.recallBridge.saveAppSettings({
+    transcriptionProvider: settingsProvider.value,
+  });
+  settingsModal.classList.remove("active");
+});

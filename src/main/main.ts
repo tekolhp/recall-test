@@ -73,6 +73,29 @@ function saveToggles(toggles: FeatureToggles): void {
 let toggles = loadToggles();
 let desktopSdkInitialized = false;
 
+// ── App settings (transcription provider, etc.) ──────────────────────
+
+const APP_SETTINGS_PATH = path.join(app.getPath("userData"), "app-settings.json");
+
+interface AppSettings {
+  transcriptionProvider: "recallai" | "deepgram";
+}
+
+function loadAppSettings(): AppSettings {
+  try {
+    if (fs.existsSync(APP_SETTINGS_PATH)) {
+      return JSON.parse(fs.readFileSync(APP_SETTINGS_PATH, "utf-8"));
+    }
+  } catch {}
+  return { transcriptionProvider: "recallai" };
+}
+
+function saveAppSettings(settings: AppSettings): void {
+  fs.writeFileSync(APP_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+}
+
+let appSettings = loadAppSettings();
+
 // ── Desktop SDK ──────────────────────────────────────────────────────
 
 async function requestPermissions() {
@@ -200,6 +223,15 @@ app.whenReady().then(async () => {
     await new Promise((r) => setTimeout(r, 500));
   }
 
+  // Sync app settings to server
+  try {
+    await fetch(`${BACKEND_URL}/api/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(appSettings),
+    });
+  } catch {}
+
   const win = createWindow();
   console.log("[main] Window created");
   console.log(`[main] Toggles: Desktop SDK=${toggles.desktopSdk}, Bot Fleet=${toggles.botFleet}`);
@@ -252,6 +284,26 @@ app.whenReady().then(async () => {
     saveToggles(toggles);
     win.webContents.send("toggle-state", toggles);
     return toggles;
+  });
+
+  // ── App Settings IPC ────────────────────────────────────────────
+
+  ipcMain.handle("get-app-settings", () => appSettings);
+
+  ipcMain.handle("save-app-settings", async (_event, settings: AppSettings) => {
+    appSettings = settings;
+    saveAppSettings(settings);
+    // Sync to backend server
+    try {
+      await fetch(`${BACKEND_URL}/api/settings`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(settings),
+      });
+    } catch (err: any) {
+      console.error("[main] Failed to sync settings to server:", err.message);
+    }
+    return appSettings;
   });
 
   // ── Desktop SDK IPC ───────────────────────────────────────────────

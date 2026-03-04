@@ -42,6 +42,12 @@ interface BotRecord {
 const bots = new Map<string, BotRecord>();
 let botCounter = 0; // Global counter for unique bot IDs across deploys
 
+// ── App settings (synced from main process) ──────────────────────────
+
+let appSettings = {
+  transcriptionProvider: "recallai" as "recallai" | "deepgram",
+};
+
 // Recover active bots from Recall API on startup
 async function recoverBots() {
   const activeStatuses = [
@@ -1061,6 +1067,19 @@ app.post("/webhooks/recall", async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── App Settings Endpoints ───────────────────────────────────────────
+
+app.get("/api/settings", (_req, res) => {
+  res.json(appSettings);
+});
+
+app.post("/api/settings", (req, res) => {
+  const { transcriptionProvider } = req.body;
+  if (transcriptionProvider) appSettings.transcriptionProvider = transcriptionProvider;
+  console.log(`[settings] Provider: ${appSettings.transcriptionProvider}`);
+  res.json(appSettings);
+});
+
 // ── Bot Fleet Endpoints ──────────────────────────────────────────────
 
 app.post("/api/bots/deploy", async (req, res) => {
@@ -1099,17 +1118,18 @@ app.post("/api/bots/deploy", async (req, res) => {
     botCounter++;
     const localId = `bot-${botCounter}`;
 
+    // Build transcription provider config based on app settings
+    const transcriptProvider =
+      appSettings.transcriptionProvider === "deepgram"
+        ? { deepgram_streaming: { language: "multi" } }
+        : { recallai_streaming: { language_code: "en", mode: "prioritize_low_latency" } };
+
     const botPayload: any = {
       meeting_url,
       bot_name: `${bot_name_prefix} ${i}`,
       recording_config: {
         transcript: {
-          provider: {
-            recallai_streaming: {
-              language_code: "en",
-              mode: "prioritize_low_latency",
-            },
-          },
+          provider: transcriptProvider,
         },
         realtime_endpoints: [],
       },

@@ -8,6 +8,11 @@ contextBridge.exposeInMainWorld("recallBridge", {
   onToggleState: (cb: (data: any) => void) =>
     ipcRenderer.on("toggle-state", (_e, data) => cb(data)),
 
+  // ── App Settings ────────────────────────────────────────────────
+  getAppSettings: () => ipcRenderer.invoke("get-app-settings"),
+  saveAppSettings: (settings: any) =>
+    ipcRenderer.invoke("save-app-settings", settings),
+
   // ── Desktop SDK ──────────────────────────────────────────────────
   startRecording: (windowId: number) =>
     ipcRenderer.invoke("start-recording", windowId),
