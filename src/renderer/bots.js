@@ -33,6 +33,8 @@ const indCamera = document.getElementById("ind-camera");
 const btnPickImage = document.getElementById("btn-pick-image");
 const toggleImage = document.getElementById("toggle-image");
 const indImage = document.getElementById("ind-image");
+const btnPickVideo = document.getElementById("btn-pick-video");
+const videoFileInput = document.getElementById("video-file-input");
 const toggleVideo = document.getElementById("toggle-video");
 const indVideo = document.getElementById("ind-video");
 const toggleScreenshare = document.getElementById("toggle-screenshare");
@@ -63,6 +65,10 @@ let isSendingFrame = false;
 let outputMediaMode = false;
 let pushSocket = null; // Direct WebSocket to server for frame pushing
 
+// Video file state
+let videoFileUrl = null; // blob URL for local preview
+let videoUploaded = false;
+
 const bridge = window.recallBridge;
 
 // ── Preview management ───────────────────────────────────────────────
@@ -72,7 +78,7 @@ function showPreview(type) {
   streamImage.classList.remove("active");
   previewPlaceholder.classList.remove("hidden");
 
-  if (type === "camera") {
+  if (type === "camera" || type === "video") {
     streamVideo.classList.add("active");
     previewPlaceholder.classList.add("hidden");
   } else if (type === "image") {
@@ -620,6 +626,13 @@ function deactivateAllOutputs() {
     indImage.classList.remove("active");
     showPreview("none");
   }
+  if (toggleVideo.classList.contains("on")) {
+    toggleVideo.classList.remove("on");
+    indVideo.classList.remove("active");
+    streamVideo.src = "";
+    streamVideo.srcObject = null;
+    showPreview("none");
+  }
   if (toggleUrl.classList.contains("on")) {
     toggleUrl.classList.remove("on");
     indUrl.classList.remove("active");
@@ -842,10 +855,76 @@ urlInput.addEventListener("keydown", (e) => {
   if (e.key === "Enter") pushUrlToBots();
 });
 
-// ── Video / Screenshare stubs ─────────────────────────────────────────
+// ── Video file upload + toggle ────────────────────────────────────────
 
-toggleVideo.addEventListener("click", () => {
-  statusBar.textContent = "Video file playback — coming soon";
+btnPickVideo.addEventListener("click", () => videoFileInput.click());
+
+videoFileInput.addEventListener("change", async () => {
+  const file = videoFileInput.files?.[0];
+  if (!file) return;
+  videoFileInput.value = "";
+
+  // Local preview blob URL
+  if (videoFileUrl) URL.revokeObjectURL(videoFileUrl);
+  videoFileUrl = URL.createObjectURL(file);
+
+  // Upload to server (read as ArrayBuffer)
+  statusBar.textContent = "Uploading video...";
+  try {
+    const buffer = await file.arrayBuffer();
+    const result = await bridge.uploadVideo(file.name, buffer);
+    if (result.error) {
+      statusBar.textContent = `Video upload failed: ${result.error}`;
+      return;
+    }
+    videoUploaded = true;
+    btnPickVideo.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+    statusBar.textContent = `Video uploaded: ${file.name}`;
+
+    // Auto-re-activate if toggle is already ON
+    if (toggleVideo.classList.contains("on")) {
+      await activateVideoOutput();
+    }
+  } catch (err) {
+    statusBar.textContent = `Video upload failed: ${err.message}`;
+  }
+});
+
+async function activateVideoOutput() {
+  try {
+    const result = await bridge.activateVideoOutput();
+    if (result.error) {
+      statusBar.textContent = `Video activation failed: ${result.error}`;
+      return;
+    }
+    streamVideo.srcObject = null;
+    streamVideo.src = videoFileUrl;
+    streamVideo.loop = true;
+    streamVideo.play().catch(() => {});
+    showPreview("video");
+    toggleVideo.classList.add("on");
+    indVideo.classList.add("active");
+    statusBar.textContent = `Video output active on ${result.activated} bot(s)`;
+  } catch (err) {
+    statusBar.textContent = `Video activation failed: ${err.message}`;
+  }
+}
+
+toggleVideo.addEventListener("click", async () => {
+  if (toggleVideo.classList.contains("on")) {
+    await deactivateAllOutputsAndApi();
+    statusBar.textContent = "Video feed cleared";
+    return;
+  }
+
+  if (!videoUploaded) {
+    // No video yet — open file picker, user will toggle after picking
+    videoFileInput.click();
+    return;
+  }
+
+  deactivateAllOutputs();
+  await activateVideoOutput();
 });
 
 toggleScreenshare.addEventListener("click", () => {

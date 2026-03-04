@@ -508,6 +508,34 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.handle("upload-video", async (_event, fileName: string, buffer: Buffer) => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+      const res = await fetch(`${BACKEND_URL}/api/upload-video`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-Filename": fileName,
+        },
+        body: new Uint8Array(buf) as any,
+      });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
+  ipcMain.handle("activate-video-output", async () => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots/activate-video-output`, { method: "POST" });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
   ipcMain.handle("get-ngrok-status", async () => {
     try {
       const res = await fetch(`${BACKEND_URL}/api/ngrok-status`);

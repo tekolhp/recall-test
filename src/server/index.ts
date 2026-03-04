@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import { createServer } from "node:http";
 import { execFile } from "node:child_process";
-import { writeFile, unlink, readFile } from "node:fs/promises";
+import { writeFile, unlink, readFile, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
@@ -232,6 +232,31 @@ app.post("/api/bots/activate-output-media", async (_req, res) => {
   res.json({ ok: true, activated });
 });
 
+// Activate video file output on all active bots
+app.post("/api/bots/activate-video-output", async (_req, res) => {
+  if (!tunnelHttpUrl) {
+    res.status(503).json({ error: "No tunnel available" });
+    return;
+  }
+  if (!currentVideoFile) {
+    res.status(400).json({ error: "No video uploaded" });
+    return;
+  }
+
+  let activated = 0;
+  for (const [, bot] of bots) {
+    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    try {
+      const url = `${tunnelHttpUrl}/output-media/video`;
+      if (await setOutputMedia(bot, url)) {
+        activated++;
+        console.log(`[bot] ${bot.id} video output activated: ${url}`);
+      }
+    } catch {}
+  }
+  res.json({ ok: true, activated });
+});
+
 // Deactivate output_media on all active bots
 app.post("/api/bots/deactivate-output-media", async (_req, res) => {
   let deactivated = 0;
@@ -411,6 +436,58 @@ app.use("/hls/webcam", express.static(HLS_DIR, {
     res.set("Access-Control-Allow-Origin", "*");
   },
 }));
+
+// ── Video file upload & playback ─────────────────────────────────────
+
+const VIDEO_DIR = path.join(process.cwd(), "media", "video");
+if (!existsSync(VIDEO_DIR)) mkdirSync(VIDEO_DIR, { recursive: true });
+
+let currentVideoFile: string | null = null;
+
+app.use("/media/video", express.static(VIDEO_DIR, {
+  setHeaders: (res) => {
+    res.set("Cache-Control", "no-cache");
+    res.set("Access-Control-Allow-Origin", "*");
+  },
+}));
+
+app.post("/api/upload-video", express.raw({ type: "*/*", limit: "500mb" }), async (req, res) => {
+  const fileName = (req.headers["x-filename"] as string) || "video.mp4";
+  if (!req.body || req.body.length === 0) {
+    res.status(400).json({ error: "No file data" });
+    return;
+  }
+
+  const ext = path.extname(fileName) || ".mp4";
+  const destName = `current${ext}`;
+  const destPath = path.join(VIDEO_DIR, destName);
+
+  try {
+    // Remove old file if extension changed
+    if (currentVideoFile && currentVideoFile !== destName) {
+      await unlink(path.join(VIDEO_DIR, currentVideoFile)).catch(() => {});
+    }
+    await writeFile(destPath, req.body);
+    currentVideoFile = destName;
+    console.log(`[video] Uploaded: ${fileName} (${req.body.length} bytes) → ${destName}`);
+    res.json({ ok: true, filename: destName });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/output-media/video", (_req, res) => {
+  if (!currentVideoFile) {
+    res.status(404).send("No video uploaded");
+    return;
+  }
+  res.type("html").send(`<!DOCTYPE html><html><head>
+<style>*{margin:0;padding:0}body{background:#000;overflow:hidden;width:100vw;height:100vh}
+video{width:100%;height:100%;object-fit:contain}</style>
+</head><body>
+<video autoplay loop muted playsinline src="/media/video/${currentVideoFile}?t=${Date.now()}"></video>
+</body></html>`);
+});
 
 // ffmpeg process for live encoding
 let ffmpegProc: ReturnType<typeof spawn> | null = null;
