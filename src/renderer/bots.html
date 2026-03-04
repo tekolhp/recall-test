@@ -119,6 +119,7 @@
     }
     .bot-tile {
       display: flex;
+      flex-wrap: wrap;
       align-items: center;
       gap: 10px;
       padding: 8px 12px;
@@ -130,6 +131,22 @@
     .bot-tile-status-text {
       font-size: 11px;
       color: #666;
+    }
+    .bot-tile-transcript {
+      width: 100%;
+      max-height: 80px;
+      overflow-y: auto;
+      font-size: 11px;
+      color: #999;
+      line-height: 1.5;
+      border-top: 1px solid #222;
+      padding-top: 6px;
+      margin-top: 2px;
+    }
+    .bot-tile-transcript:empty { display: none; }
+    .bot-tile-transcript .speaker {
+      color: #4f8eff;
+      font-weight: 500;
     }
     .bot-tile-indicator {
       width: 10px;
@@ -361,6 +378,11 @@
       transition: transform 0.2s;
     }
     .feature-toggle.on::after { transform: translateX(16px); }
+    .feature-toggle.busy {
+      pointer-events: none;
+      cursor: default;
+      opacity: 0.35;
+    }
     .feature-indicator {
       width: 10px;
       height: 10px;

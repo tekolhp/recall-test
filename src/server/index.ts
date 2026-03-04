@@ -1,7 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import { createServer } from "node:http";
-import { execFile } from "node:child_process";
+import { execFile, spawn as nodeSpawn, ChildProcess } from "node:child_process";
 import { writeFile, unlink, readFile, copyFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -282,6 +282,31 @@ app.post("/api/bots/activate-music-output", async (_req, res) => {
   res.json({ ok: true, activated });
 });
 
+app.post("/api/bots/activate-youtube", express.json(), async (req, res) => {
+  if (!tunnelHttpUrl) {
+    res.status(503).json({ error: "No tunnel available" });
+    return;
+  }
+  const { videoId } = req.body;
+  if (!videoId) {
+    res.status(400).json({ error: "Missing videoId" });
+    return;
+  }
+
+  let activated = 0;
+  for (const [, bot] of bots) {
+    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    try {
+      const url = `${tunnelHttpUrl}/output-media/youtube?v=${videoId}`;
+      if (await setOutputMedia(bot, url)) {
+        activated++;
+        console.log(`[bot] ${bot.id} YouTube output activated: ${url}`);
+      }
+    } catch {}
+  }
+  res.json({ ok: true, activated });
+});
+
 // Deactivate output_media on all active bots
 app.post("/api/bots/deactivate-output-media", async (_req, res) => {
   let deactivated = 0;
@@ -335,6 +360,146 @@ wssPush.on("connection", (ws) => {
   ws.on("close", () => {
     console.log("[ws] Frame push client disconnected");
   });
+});
+
+// ── WebSocket for gapless audio streaming (mic → ffmpeg → MP3 → Recall API) ──
+const wssAudio = new WebSocketServer({ server, path: "/ws/audio-push" });
+
+wssAudio.on("connection", (ws) => {
+  console.log("[ws-audio] Audio push client connected");
+
+  let ffmpeg: ChildProcess | null = null;
+  let mp3Buffer: Buffer[] = [];
+  let flushInterval: ReturnType<typeof setInterval> | null = null;
+
+  // Spawn persistent ffmpeg: webm stdin → mp3 stdout
+  ffmpeg = nodeSpawn("ffmpeg", [
+    "-f", "webm", "-i", "pipe:0",
+    "-codec:a", "libmp3lame", "-b:a", "128k",
+    "-f", "mp3", "pipe:1",
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+
+  ffmpeg.stderr?.on("data", (d: Buffer) => {
+    // Suppress ffmpeg logs (too noisy), only log errors
+    const msg = d.toString();
+    if (msg.includes("Error") || msg.includes("error")) {
+      console.error(`[ws-audio:ffmpeg] ${msg.trim()}`);
+    }
+  });
+
+  ffmpeg.stdout?.on("data", (chunk: Buffer) => {
+    mp3Buffer.push(chunk);
+  });
+
+  ffmpeg.on("exit", (code) => {
+    console.log(`[ws-audio] ffmpeg exited with code ${code}`);
+    ffmpeg = null;
+  });
+
+  // Every 3 seconds, flush accumulated MP3 bytes to all active bots
+  flushInterval = setInterval(async () => {
+    if (mp3Buffer.length === 0) return;
+
+    const mp3Data = Buffer.concat(mp3Buffer);
+    mp3Buffer = [];
+
+    if (mp3Data.length < 100) return; // too small, skip
+
+    const mp3B64 = mp3Data.toString("base64");
+    const activeBotList = Array.from(bots.values()).filter(
+      (b) => !["done", "fatal", "leaving"].includes(b.status)
+    );
+
+    if (activeBotList.length === 0) return;
+
+    const body = JSON.stringify({ data: { kind: "mp3", b64_data: mp3B64 } });
+    await Promise.allSettled(
+      activeBotList.map((bot) =>
+        fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_audio/`, {
+          method: "POST",
+          headers: {
+            Authorization: `Token ${API_KEY}`,
+            "Content-Type": "application/json",
+          },
+          body,
+        })
+      )
+    );
+  }, 3000);
+
+  ws.on("message", (data: Buffer) => {
+    // Write raw webm chunk to ffmpeg stdin
+    if (ffmpeg && ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
+      ffmpeg.stdin.write(data);
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("[ws-audio] Audio push client disconnected");
+    if (flushInterval) { clearInterval(flushInterval); flushInterval = null; }
+    if (ffmpeg) {
+      ffmpeg.stdin?.end();
+      ffmpeg.kill("SIGTERM");
+      ffmpeg = null;
+    }
+    mp3Buffer = [];
+  });
+});
+
+// ── WebSocket for real-time transcript push to renderer ──────────────
+const wssTranscript = new WebSocketServer({ server, path: "/ws/transcript" });
+const transcriptClients = new Set<WebSocket>();
+
+wssTranscript.on("connection", (ws) => {
+  console.log("[ws-transcript] Client connected");
+  transcriptClients.add(ws);
+  ws.on("close", () => {
+    transcriptClients.delete(ws);
+    console.log("[ws-transcript] Client disconnected");
+  });
+});
+
+function pushTranscriptToClients(data: any) {
+  const msg = JSON.stringify(data);
+  for (const client of transcriptClients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(msg);
+    }
+  }
+}
+
+// ── Webhook: real-time transcription from Recall.ai ──────────────────
+app.post("/webhook/transcription", express.json(), (req, res) => {
+  const event = req.body;
+  const eventType = event.event; // "transcript.data" or "transcript.partial_data"
+  const data = event.data || {};
+  console.log(`[transcript-webhook] ${eventType || "unknown"} — ${JSON.stringify(event).slice(0, 300)}`);
+
+  // Find local bot ID by matching recallBotId
+  const recallBotId = data.bot?.id || event.bot_id;
+  let localBotId: string | null = null;
+  for (const [id, bot] of bots) {
+    if (bot.recallBotId === recallBotId) {
+      localBotId = id;
+      break;
+    }
+  }
+
+  const speaker = data.participant?.name || "?";
+  const words = data.words || [];
+  const text = words.map((w: any) => w.text).join(" ") || data.text || "";
+  const isFinal = eventType === "transcript.data";
+
+  if (text.trim()) {
+    pushTranscriptToClients({
+      botId: localBotId || recallBotId,
+      speaker,
+      text,
+      is_final: isFinal,
+    });
+  }
+
+  res.sendStatus(200);
 });
 
 const outputMediaClients = new Map<string, Set<WebSocket>>();
@@ -549,6 +714,22 @@ app.get("/output-media/music", (_req, res) => {
 </head><body>
 <audio id="a" autoplay loop src="/media/music/${currentMusicFile}?t=${Date.now()}"></audio>
 <script>document.getElementById("a").play().catch(()=>{});</script>
+</body></html>`);
+});
+
+app.get("/output-media/youtube", (req, res) => {
+  const videoId = req.query.v as string;
+  if (!videoId) {
+    res.status(400).send("Missing ?v= parameter");
+    return;
+  }
+  res.type("html").send(`<!DOCTYPE html><html><head>
+<meta name="referrer" content="strict-origin-when-cross-origin">
+<style>*{margin:0;padding:0}body{background:#000;overflow:hidden;width:100vw;height:100vh}
+iframe{width:100%;height:100%;border:none}</style>
+</head><body>
+<iframe src="https://www.youtube-nocookie.com/embed/${videoId}?autoplay=1&mute=0&controls=0&loop=1&playlist=${videoId}"
+  allow="autoplay; encrypted-media" allowfullscreen></iframe>
 </body></html>`);
 });
 
@@ -878,26 +1059,38 @@ app.post("/api/bots/deploy", async (req, res) => {
       bot_name: `${bot_name_prefix} ${i}`,
       recording_config: {
         transcript: {
-          provider: { meeting_captions: {} },
+          provider: {
+            recallai_streaming: {
+              language_code: "en",
+              mode: "prioritize_low_latency",
+            },
+          },
         },
+        realtime_endpoints: [],
       },
       zoom: {
         breakout_room_handling: "auto_accept_all_invites",
       },
     };
 
+    // Real-time transcription webhook (requires tunnel)
+    if (tunnelHttpUrl) {
+      botPayload.recording_config.realtime_endpoints.push({
+        type: "webhook",
+        url: `${tunnelHttpUrl}/webhook/transcription`,
+        events: ["transcript.data", "transcript.partial_data"],
+      });
+    }
+
     // RTMP streaming: receive live 720p/30fps video from the meeting
     if (ngrokTcpUrl) {
-      // Convert tcp://host:port to rtmp://host:port/live/bot-{i}
       const rtmpUrl = ngrokTcpUrl.replace("tcp://", "rtmp://") + `/live/${localId}`;
       botPayload.recording_config.video_mixed_flv = {};
-      botPayload.recording_config.realtime_endpoints = [
-        {
-          type: "rtmp",
-          url: rtmpUrl,
-          events: ["video_mixed_flv.data"],
-        },
-      ];
+      botPayload.recording_config.realtime_endpoints.push({
+        type: "rtmp",
+        url: rtmpUrl,
+        events: ["video_mixed_flv.data"],
+      });
       console.log(`[bot] ${localId} RTMP stream → ${rtmpUrl}`);
     }
 
@@ -1432,8 +1625,9 @@ app.get("/api/bots/:id/transcript", async (req, res) => {
   }
 
   try {
+    // Use the new transcript API (the old /bot/{id}/transcript/ is deprecated)
     const response = await fetch(
-      `${BASE_URL}/api/v1/bot/${bot.recallBotId}/transcript/`,
+      `${BASE_URL}/api/v1/transcript/?bot_id=${bot.recallBotId}`,
       { headers: { Authorization: `Token ${API_KEY}` } }
     );
 
@@ -1443,7 +1637,40 @@ app.get("/api/bots/:id/transcript", async (req, res) => {
     }
 
     const data = await response.json();
-    res.json(data);
+    const transcripts = data.results || [];
+    const allSegments: any[] = [];
+
+    // Fetch transcript data from all available download URLs
+    for (const t of transcripts) {
+      if (t.status?.code === "done" && t.data?.download_url) {
+        try {
+          const dlRes = await fetch(t.data.download_url);
+          if (dlRes.ok) {
+            const segments = await dlRes.json();
+            if (Array.isArray(segments)) {
+              allSegments.push(...segments);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // Also check the "processing" transcript (current live session)
+    for (const t of transcripts) {
+      if (t.status?.code === "processing" && t.data?.download_url) {
+        try {
+          const dlRes = await fetch(t.data.download_url);
+          if (dlRes.ok) {
+            const segments = await dlRes.json();
+            if (Array.isArray(segments)) {
+              allSegments.push(...segments);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    res.json(allSegments);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

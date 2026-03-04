@@ -66,6 +66,7 @@ let isSendingFrame = false;
 // Output Media mode (30fps via ngrok webpage vs 5fps via API)
 let outputMediaMode = false;
 let pushSocket = null; // Direct WebSocket to server for frame pushing
+let audioSocket = null; // WebSocket for gapless audio streaming
 
 // Video file state
 let videoFileUrl = null; // blob URL for local preview
@@ -73,6 +74,9 @@ let videoUploaded = false;
 
 // Music file state
 let musicUploaded = false;
+
+// Global lock: prevents concurrent toggle operations
+let outputToggleBusy = false;
 
 const bridge = window.recallBridge;
 
@@ -120,6 +124,50 @@ function connectPushSocket() {
   pushSocket.onerror = () => pushSocket?.close();
 }
 
+// ── Real-time transcript WebSocket ────────────────────────────────────
+let transcriptSocket = null;
+
+function connectTranscriptSocket() {
+  if (transcriptSocket) return;
+  transcriptSocket = new WebSocket("ws://localhost:3000/ws/transcript");
+  transcriptSocket.onopen = () => console.log("[ws] Transcript socket connected");
+  transcriptSocket.onmessage = (e) => {
+    try {
+      const data = JSON.parse(e.data);
+      const el = document.getElementById(`transcript-${data.botId}`);
+      if (!el) return;
+
+      // Mark this bot as receiving real-time data (skip poll fallback)
+      el.dataset.realtime = "1";
+
+      // Clear "Listening..." placeholder on first real data
+      if (!el.dataset.hasData) {
+        el.innerHTML = "";
+        el.dataset.hasData = "1";
+      }
+
+      // Append new line
+      const line = document.createElement("div");
+      if (data.is_final) {
+        line.textContent = data.text;
+      } else {
+        line.innerHTML = `<em style="color:#666">${data.text}</em>`;
+      }
+      el.appendChild(line);
+
+      // Keep only last 20 lines
+      while (el.children.length > 20) el.removeChild(el.firstChild);
+      el.scrollTop = el.scrollHeight;
+    } catch {}
+  };
+  transcriptSocket.onclose = () => {
+    transcriptSocket = null;
+    setTimeout(connectTranscriptSocket, 3000);
+  };
+  transcriptSocket.onerror = () => transcriptSocket?.close();
+}
+
+connectTranscriptSocket();
 checkNgrokStatus();
 
 // ── Listen for toggle state changes ───────────────────────────────────
@@ -346,10 +394,33 @@ async function broadcastCurrentImage() {
 }
 
 modalSend.addEventListener("click", async () => {
-  if (!pendingImageB64) return;
+  if (!pendingImageB64 || outputToggleBusy) return;
   modalSend.disabled = true;
   modalSend.textContent = "Sending...";
-  await broadcastCurrentImage();
+
+  outputToggleBusy = true;
+  deactivateAllOutputs();
+  toggleImage.classList.add("on");
+  toggleImage.classList.add("busy");
+
+  try {
+    // DELETE output_media first (camera webpage takes precedence over output_video JPEG)
+    await bridge.deactivateOutputMedia().catch(() => {});
+    const result = await bridge.broadcastImage(pendingImageB64);
+    if (result.error) throw new Error(result.error);
+    streamImage.src = `data:image/jpeg;base64,${pendingImageB64}`;
+    showPreview("image");
+    indImage.classList.add("active");
+    statusBar.textContent = `Image sent to ${result.sent} bot(s)`;
+  } catch (err) {
+    toggleImage.classList.remove("on");
+    indImage.classList.remove("active");
+    statusBar.textContent = `Broadcast failed: ${err.message}`;
+  } finally {
+    toggleImage.classList.remove("busy");
+    outputToggleBusy = false;
+  }
+
   modalSend.textContent = "Send";
   closeModal();
 });
@@ -408,6 +479,7 @@ function createBotTile(bot) {
     <span class="bot-tile-status-text">${formatStatus(bot.status)}</span>
     <div class="bot-tile-indicator ${isActive ? "active" : ""}"></div>
     <div class="feature-toggle ${isActive ? "on" : ""}" data-bot-id="${bot.id}"></div>
+    <div class="bot-tile-transcript" id="transcript-${bot.id}">${isActive ? '<div style="color:#555;font-style:italic">Listening for transcript...</div>' : ''}</div>
   `;
 
   tile.querySelector(".feature-toggle").addEventListener("click", async () => {
@@ -530,9 +602,9 @@ function startPolling() {
         statusBar.textContent =
           `${bots.length} bot(s) | ${active.length} active | ${inBreakout.length} in breakout rooms`;
 
-        // Fetch transcripts for done bots
+        // Fallback: poll transcripts in case webhook doesn't deliver
         for (const bot of bots) {
-          if (bot.status === "done") {
+          if (!["done", "fatal"].includes(bot.status)) {
             updateTranscript(bot.id);
           }
         }
@@ -557,26 +629,33 @@ function stopPolling() {
 
 async function updateTranscript(botId) {
   try {
-    const data = await bridge.getBotTranscript(botId);
     const el = document.getElementById(`transcript-${botId}`);
     if (!el) return;
+
+    // Skip poll if this bot is already receiving real-time WebSocket data
+    if (el.dataset.realtime === "1") return;
+
+    const data = await bridge.getBotTranscript(botId);
 
     // Handle array of transcript segments or results array
     const segments = Array.isArray(data) ? data : data?.results || [];
     if (segments.length === 0) return;
 
     const html = segments
-      .slice(-10)
+      .slice(-5)
       .map((seg) => {
-        const speaker = seg.speaker || seg.participant?.name || "?";
         const text =
           seg.words?.map((w) => w.text).join(" ") || seg.text || "";
-        return `<span class="speaker">${speaker}:</span> ${text}`;
+        if (!text.trim()) return null;
+        return text;
       })
+      .filter(Boolean)
       .join("<br>");
 
-    el.innerHTML = html;
-    el.scrollTop = el.scrollHeight;
+    if (html && html !== el.innerHTML) {
+      el.innerHTML = html;
+      el.scrollTop = el.scrollHeight;
+    }
   } catch {
     // Transcript not available yet
   }
@@ -606,6 +685,10 @@ function stopAudioStream() {
   if (audioRecorder) {
     audioRecorder.stop();
     audioRecorder = null;
+  }
+  if (audioSocket) {
+    audioSocket.close();
+    audioSocket = null;
   }
   if (audioStream) {
     audioStream.getTracks().forEach((t) => t.stop());
@@ -665,65 +748,84 @@ let videoRecorder = null;
 
 // Auto-switch source when dropdown changes while camera is ON
 cameraSource.addEventListener("change", async () => {
+  if (outputToggleBusy) return;
   if (toggleCamera.classList.contains("on")) {
-    // Stop current stream, then re-start with new source
     stopCamera();
-    toggleCamera.click(); // re-trigger the ON logic
+    toggleCamera.click();
   }
 });
 
 toggleCamera.addEventListener("click", async () => {
-  if (toggleCamera.classList.contains("on")) {
-    await deactivateAllOutputsAndApi();
-    statusBar.textContent = "Camera feed cleared";
-    return;
-  }
+  if (outputToggleBusy) return;
 
+  const turningOff = toggleCamera.classList.contains("on");
   const source = cameraSource.value;
-  if (!source) {
+
+  if (!turningOff && !source) {
     statusBar.textContent = "Select a camera source first";
     return;
   }
 
-  deactivateAllOutputs();
+  // Instant visual feedback
+  outputToggleBusy = true;
+  if (turningOff) {
+    toggleCamera.classList.remove("on");
+    indCamera.classList.remove("active");
+  } else {
+    deactivateAllOutputs();
+    toggleCamera.classList.add("on");
+  }
+  toggleCamera.classList.add("busy");
 
   try {
-    if (source === "camera") {
-      videoStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-        audio: false,
-      });
-    } else if (source === "screen") {
-      const sources = await bridge.getSources();
-      if (sources.length === 0) {
-        statusBar.textContent = "No screen sources available";
-        return;
-      }
-      const screenSource = sources.find((s) => s.name === "Entire Screen") || sources[0];
-      videoStream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          mandatory: {
-            chromeMediaSource: "desktop",
-            chromeMediaSourceId: screenSource.id,
-            maxWidth: 1280,
-            maxHeight: 720,
+    if (turningOff) {
+      stopCamera();
+      showPreview("none");
+      await bridge.deactivateOutputMedia().catch(() => {});
+      statusBar.textContent = "Camera feed cleared";
+    } else {
+      if (source === "camera") {
+        videoStream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+          audio: false,
+        });
+      } else if (source === "screen") {
+        const sources = await bridge.getSources();
+        if (sources.length === 0) throw new Error("No screen sources available");
+        const screenSource = sources.find((s) => s.name === "Entire Screen") || sources[0];
+        videoStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            mandatory: {
+              chromeMediaSource: "desktop",
+              chromeMediaSourceId: screenSource.id,
+              maxWidth: 1280,
+              maxHeight: 720,
+            },
           },
-        },
-        audio: false,
-      });
-    }
+          audio: false,
+        });
+      }
 
-    streamVideo.srcObject = videoStream;
-    cameraSource.disabled = true;
-    startVideoRecorder();
-    toggleCamera.classList.add("on");
-    indCamera.classList.add("active");
-    showPreview("camera");
-    // Activate output_media on all bots so they show the HLS stream
-    bridge.activateOutputMedia();
-    statusBar.textContent = "Camera streaming (HLS)";
+      streamVideo.srcObject = videoStream;
+      cameraSource.disabled = true;
+      startVideoRecorder();
+      indCamera.classList.add("active");
+      showPreview("camera");
+      bridge.activateOutputMedia();
+      statusBar.textContent = "Camera streaming (HLS)";
+    }
   } catch (err) {
+    if (turningOff) {
+      toggleCamera.classList.add("on");
+      indCamera.classList.add("active");
+    } else {
+      toggleCamera.classList.remove("on");
+      indCamera.classList.remove("active");
+    }
     statusBar.textContent = `Camera failed: ${err.message}`;
+  } finally {
+    toggleCamera.classList.remove("busy");
+    outputToggleBusy = false;
   }
 });
 
@@ -795,24 +897,62 @@ btnPickImage.addEventListener("click", () => {
 });
 
 toggleImage.addEventListener("click", async () => {
-  if (toggleImage.classList.contains("on")) {
-    await deactivateAllOutputsAndApi();
-    statusBar.textContent = "Image feed cleared";
-  } else if (pendingImageB64) {
-    // ON = broadcast the current image (turns off others first)
-    deactivateAllOutputs();
-    await broadcastCurrentImage();
-  } else {
-    // No image yet — open picker
+  if (outputToggleBusy) return;
+
+  const turningOff = toggleImage.classList.contains("on");
+
+  if (!turningOff && !pendingImageB64) {
     modalTargetBotId = null;
     modalTitle.textContent = "Choose Image";
     openModal();
+    return;
+  }
+
+  outputToggleBusy = true;
+  if (turningOff) {
+    toggleImage.classList.remove("on");
+    indImage.classList.remove("active");
+  } else {
+    deactivateAllOutputs();
+    toggleImage.classList.add("on");
+  }
+  toggleImage.classList.add("busy");
+
+  try {
+    if (turningOff) {
+      showPreview("none");
+      await bridge.deactivateOutputMedia().catch(() => {});
+      statusBar.textContent = "Image feed cleared";
+    } else {
+      // DELETE output_media first (camera webpage takes precedence over output_video JPEG)
+      await bridge.deactivateOutputMedia().catch(() => {});
+      const result = await bridge.broadcastImage(pendingImageB64);
+      if (result.error) throw new Error(result.error);
+      streamImage.src = `data:image/jpeg;base64,${pendingImageB64}`;
+      showPreview("image");
+      indImage.classList.add("active");
+      statusBar.textContent = `Image sent to ${result.sent} bot(s)`;
+    }
+  } catch (err) {
+    if (turningOff) {
+      toggleImage.classList.add("on");
+      indImage.classList.add("active");
+    } else {
+      toggleImage.classList.remove("on");
+      indImage.classList.remove("active");
+    }
+    statusBar.textContent = `Image failed: ${err.message}`;
+  } finally {
+    toggleImage.classList.remove("busy");
+    outputToggleBusy = false;
   }
 });
 
 // ── URL toggle + send ─────────────────────────────────────────────────
 
 async function pushUrlToBots() {
+  if (outputToggleBusy) return false;
+
   let url = urlInput.value.trim();
   if (!url) {
     statusBar.textContent = "Enter a URL first";
@@ -824,34 +964,67 @@ async function pushUrlToBots() {
     urlInput.value = url;
   }
 
+  // Detect YouTube URLs — will use tunnel proxy page to avoid Error 153
+  const ytMatch = url.match(
+    /(?:youtube\.com\/watch\?v=|youtu\.be\/|youtube\.com\/shorts\/|youtube\.com\/embed\/)([\w-]+)/
+  );
+
+  outputToggleBusy = true;
   deactivateAllOutputs();
-
-  let sent = 0;
-  for (const bot of activeBots) {
-    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
-    try {
-      const result = await bridge.startOutputMedia(bot.id, url);
-      if (result.error) {
-        statusBar.textContent = `URL failed: ${result.error}`;
-        return false;
-      }
-      sent++;
-    } catch (err) {
-      statusBar.textContent = `URL failed: ${err.message}`;
-      return false;
-    }
-  }
-
   toggleUrl.classList.add("on");
-  indUrl.classList.add("active");
-  statusBar.textContent = `URL output active on ${sent} bot(s): ${url}`;
-  return true;
+  toggleUrl.classList.add("busy");
+
+  try {
+    let sent = 0;
+    if (ytMatch) {
+      // YouTube: activate via server (serves proxied page through tunnel)
+      const result = await bridge.activateYouTube(ytMatch[1]);
+      if (result.error) throw new Error(result.error);
+      sent = result.activated || 0;
+    } else {
+      // Regular URL: send directly to each bot
+      for (const bot of activeBots) {
+        if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+        const result = await bridge.startOutputMedia(bot.id, url);
+        if (result.error) throw new Error(result.error);
+        sent++;
+      }
+    }
+
+    indUrl.classList.add("active");
+    statusBar.textContent = `URL output active on ${sent} bot(s): ${url}`;
+    return true;
+  } catch (err) {
+    toggleUrl.classList.remove("on");
+    indUrl.classList.remove("active");
+    statusBar.textContent = `URL failed: ${err.message}`;
+    return false;
+  } finally {
+    toggleUrl.classList.remove("busy");
+    outputToggleBusy = false;
+  }
 }
 
 toggleUrl.addEventListener("click", async () => {
+  if (outputToggleBusy) return;
+
   if (toggleUrl.classList.contains("on")) {
-    await deactivateAllOutputsAndApi();
-    statusBar.textContent = "URL feed cleared";
+    outputToggleBusy = true;
+    toggleUrl.classList.remove("on");
+    indUrl.classList.remove("active");
+    toggleUrl.classList.add("busy");
+
+    try {
+      showPreview("none");
+      await bridge.deactivateOutputMedia().catch(() => {});
+      statusBar.textContent = "URL feed cleared";
+    } catch (err) {
+      toggleUrl.classList.add("on");
+      indUrl.classList.add("active");
+    } finally {
+      toggleUrl.classList.remove("busy");
+      outputToggleBusy = false;
+    }
     return;
   }
   await pushUrlToBots();
@@ -892,8 +1065,15 @@ videoFileInput.addEventListener("change", async () => {
     statusBar.textContent = `Video uploaded: ${file.name}`;
 
     // Auto-re-activate if toggle is already ON
-    if (toggleVideo.classList.contains("on")) {
-      await activateVideoOutput();
+    if (toggleVideo.classList.contains("on") && !outputToggleBusy) {
+      outputToggleBusy = true;
+      toggleVideo.classList.add("busy");
+      try {
+        await activateVideoOutput();
+      } finally {
+        toggleVideo.classList.remove("busy");
+        outputToggleBusy = false;
+      }
     }
   } catch (err) {
     statusBar.textContent = `Video upload failed: ${err.message}`;
@@ -921,20 +1101,56 @@ async function activateVideoOutput() {
 }
 
 toggleVideo.addEventListener("click", async () => {
-  if (toggleVideo.classList.contains("on")) {
-    await deactivateAllOutputsAndApi();
-    statusBar.textContent = "Video feed cleared";
-    return;
-  }
+  if (outputToggleBusy) return;
 
-  if (!videoUploaded) {
-    // No video yet — open file picker, user will toggle after picking
+  const turningOff = toggleVideo.classList.contains("on");
+
+  if (!turningOff && !videoUploaded) {
     videoFileInput.click();
     return;
   }
 
-  deactivateAllOutputs();
-  await activateVideoOutput();
+  outputToggleBusy = true;
+  if (turningOff) {
+    toggleVideo.classList.remove("on");
+    indVideo.classList.remove("active");
+  } else {
+    deactivateAllOutputs();
+    toggleVideo.classList.add("on");
+  }
+  toggleVideo.classList.add("busy");
+
+  try {
+    if (turningOff) {
+      streamVideo.src = "";
+      streamVideo.srcObject = null;
+      showPreview("none");
+      await bridge.deactivateOutputMedia().catch(() => {});
+      statusBar.textContent = "Video feed cleared";
+    } else {
+      const result = await bridge.activateVideoOutput();
+      if (result.error) throw new Error(result.error);
+      streamVideo.srcObject = null;
+      streamVideo.src = videoFileUrl;
+      streamVideo.loop = true;
+      streamVideo.play().catch(() => {});
+      showPreview("video");
+      indVideo.classList.add("active");
+      statusBar.textContent = `Video output active on ${result.activated} bot(s)`;
+    }
+  } catch (err) {
+    if (turningOff) {
+      toggleVideo.classList.add("on");
+      indVideo.classList.add("active");
+    } else {
+      toggleVideo.classList.remove("on");
+      indVideo.classList.remove("active");
+    }
+    statusBar.textContent = `Video failed: ${err.message}`;
+  } finally {
+    toggleVideo.classList.remove("busy");
+    outputToggleBusy = false;
+  }
 });
 
 
@@ -959,8 +1175,15 @@ musicFileInput.addEventListener("change", async () => {
     btnPickMusic.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
     statusBar.textContent = `Music uploaded: ${file.name}`;
 
-    if (toggleMusic.classList.contains("on")) {
-      await activateMusicOutput();
+    if (toggleMusic.classList.contains("on") && !outputToggleBusy) {
+      outputToggleBusy = true;
+      toggleMusic.classList.add("busy");
+      try {
+        await activateMusicOutput();
+      } finally {
+        toggleMusic.classList.remove("busy");
+        outputToggleBusy = false;
+      }
     }
   } catch (err) {
     statusBar.textContent = `Music upload failed: ${err.message}`;
@@ -984,68 +1207,126 @@ async function activateMusicOutput() {
 }
 
 toggleMusic.addEventListener("click", async () => {
-  if (toggleMusic.classList.contains("on")) {
-    await deactivateAllOutputsAndApi();
-    statusBar.textContent = "Music feed cleared";
-    return;
-  }
+  if (outputToggleBusy) return;
 
-  if (!musicUploaded) {
+  const turningOff = toggleMusic.classList.contains("on");
+
+  if (!turningOff && !musicUploaded) {
     musicFileInput.click();
     return;
   }
 
-  deactivateAllOutputs();
-  await activateMusicOutput();
+  outputToggleBusy = true;
+  if (turningOff) {
+    toggleMusic.classList.remove("on");
+    indMusic.classList.remove("active");
+  } else {
+    deactivateAllOutputs();
+    toggleMusic.classList.add("on");
+  }
+  toggleMusic.classList.add("busy");
+
+  try {
+    if (turningOff) {
+      showPreview("none");
+      await bridge.deactivateOutputMedia().catch(() => {});
+      statusBar.textContent = "Music feed cleared";
+    } else {
+      const result = await bridge.activateMusicOutput();
+      if (result.error) throw new Error(result.error);
+      showPreview("none");
+      indMusic.classList.add("active");
+      statusBar.textContent = `Music output active on ${result.activated} bot(s)`;
+    }
+  } catch (err) {
+    if (turningOff) {
+      toggleMusic.classList.add("on");
+      indMusic.classList.add("active");
+    } else {
+      toggleMusic.classList.remove("on");
+      indMusic.classList.remove("active");
+    }
+    statusBar.textContent = `Music failed: ${err.message}`;
+  } finally {
+    toggleMusic.classList.remove("busy");
+    outputToggleBusy = false;
+  }
 });
 
 // ── Audio toggle ──────────────────────────────────────────────────────
 
 toggleAudio.addEventListener("click", async () => {
-  if (toggleAudio.classList.contains("on")) {
-    await deactivateAllOutputsAndApi();
-    statusBar.textContent = "Audio feed cleared";
-    return;
-  }
+  if (outputToggleBusy) return;
 
-  deactivateAllOutputs();
+  const turningOff = toggleAudio.classList.contains("on");
+
+  outputToggleBusy = true;
+  if (turningOff) {
+    toggleAudio.classList.remove("on");
+    indAudio.classList.remove("active");
+  } else {
+    deactivateAllOutputs();
+    toggleAudio.classList.add("on");
+  }
+  toggleAudio.classList.add("busy");
 
   try {
-    audioStream = await navigator.mediaDevices.getUserMedia({
-      audio: true,
-      video: false,
-    });
+    if (turningOff) {
+      stopAudioStream();
+      await bridge.deactivateOutputMedia().catch(() => {});
+      statusBar.textContent = "Audio feed cleared";
+    } else {
+      audioStream = await navigator.mediaDevices.getUserMedia({
+        audio: true,
+        video: false,
+      });
 
-    audioRecorder = new MediaRecorder(audioStream, {
-      mimeType: "audio/webm;codecs=opus",
-    });
+      // Connect WebSocket for gapless audio streaming
+      audioSocket = new WebSocket("ws://localhost:3000/ws/audio-push");
+      audioSocket.binaryType = "arraybuffer";
+      await new Promise((resolve, reject) => {
+        audioSocket.onopen = resolve;
+        audioSocket.onerror = () => reject(new Error("Audio WebSocket failed"));
+        setTimeout(() => reject(new Error("Audio WebSocket timeout")), 5000);
+      });
 
-    audioRecorder.ondataavailable = async (e) => {
-      if (e.data.size === 0) return;
-      const buffer = await e.data.arrayBuffer();
-      const b64 = btoa(
-        new Uint8Array(buffer).reduce(
-          (data, byte) => data + String.fromCharCode(byte),
-          ""
-        )
-      );
-      try { await bridge.broadcastAudioWebm(b64); } catch {}
-    };
+      audioRecorder = new MediaRecorder(audioStream, {
+        mimeType: "audio/webm;codecs=opus",
+      });
 
-    audioRecorder.start();
-    audioChunkInterval = setInterval(() => {
-      if (audioRecorder && audioRecorder.state === "recording") {
-        audioRecorder.stop();
-        audioRecorder.start();
-      }
-    }, 3000);
+      // Send raw webm chunks via WebSocket (no base64, no IPC round-trip)
+      audioRecorder.ondataavailable = async (e) => {
+        if (e.data.size === 0) return;
+        const buffer = await e.data.arrayBuffer();
+        if (audioSocket && audioSocket.readyState === WebSocket.OPEN) {
+          audioSocket.send(buffer);
+        }
+      };
 
-    toggleAudio.classList.add("on");
-    indAudio.classList.add("active");
-    statusBar.textContent = "Audio streaming (3s chunks)";
-    updateStreamInfo();
+      // Start continuous recording — requestData() flushes without stopping
+      audioRecorder.start();
+      audioChunkInterval = setInterval(() => {
+        if (audioRecorder && audioRecorder.state === "recording") {
+          audioRecorder.requestData(); // gapless: no stop/start cycle
+        }
+      }, 3000);
+
+      indAudio.classList.add("active");
+      statusBar.textContent = "Audio streaming (gapless)";
+      updateStreamInfo();
+    }
   } catch (err) {
+    if (turningOff) {
+      toggleAudio.classList.add("on");
+      indAudio.classList.add("active");
+    } else {
+      toggleAudio.classList.remove("on");
+      indAudio.classList.remove("active");
+    }
     statusBar.textContent = `Audio failed: ${err.message}`;
+  } finally {
+    toggleAudio.classList.remove("busy");
+    outputToggleBusy = false;
   }
 });
 

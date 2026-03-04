@@ -12,14 +12,22 @@ let serverProcess: ChildProcess | null = null;
 
 function startBackendServer() {
   if (serverProcess) return;
-  const serverScript = path.join(__dirname, "..", "..", "src", "server", "index.ts");
+  const projectRoot = path.join(__dirname, "..", "..");
+  const serverScript = path.join(projectRoot, "src", "server", "index.ts");
+  // Use shell: true so spawn inherits the full PATH (npx/tsx may not be
+  // on Electron's default PATH when launched from Finder)
   serverProcess = spawn("npx", ["tsx", serverScript], {
-    cwd: path.join(__dirname, "..", ".."),
+    cwd: projectRoot,
     stdio: ["ignore", "pipe", "pipe"],
+    shell: true,
     env: { ...process.env },
   });
   serverProcess.stdout?.on("data", (d: Buffer) => process.stdout.write(`[server] ${d}`));
-  serverProcess.stderr?.on("data", (d: Buffer) => process.stderr.write(`[server] ${d}`));
+  serverProcess.stderr?.on("data", (d: Buffer) => process.stderr.write(`[server:err] ${d}`));
+  serverProcess.on("error", (err) => {
+    console.error(`[main] Failed to start server: ${err.message}`);
+    serverProcess = null;
+  });
   serverProcess.on("exit", (code) => {
     console.log(`[main] Server exited with code ${code}`);
     serverProcess = null;
@@ -182,8 +190,15 @@ function createWindow() {
 // ── App ready ────────────────────────────────────────────────────────
 
 app.whenReady().then(async () => {
-  // Auto-start backend server
+  // Auto-start backend server and wait until it's ready
   startBackendServer();
+  for (let i = 0; i < 30; i++) {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots`);
+      if (res.ok) { console.log("[main] Backend server ready"); break; }
+    } catch {}
+    await new Promise((r) => setTimeout(r, 500));
+  }
 
   const win = createWindow();
   console.log("[main] Window created");
@@ -548,6 +563,20 @@ app.whenReady().then(async () => {
     if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
     try {
       const res = await fetch(`${BACKEND_URL}/api/bots/activate-music-output`, { method: "POST" });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
+  ipcMain.handle("activate-youtube", async (_event, videoId: string) => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots/activate-youtube`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ videoId }),
+      });
       return await res.json();
     } catch (err: any) {
       return { error: err.message };
