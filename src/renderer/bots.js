@@ -146,17 +146,30 @@ function connectTranscriptSocket() {
         el.dataset.hasData = "1";
       }
 
-      // Append new line
-      const line = document.createElement("div");
       if (data.is_final) {
+        // Remove the partial line if it exists
+        const partial = el.querySelector(".partial");
+        if (partial) partial.remove();
+        // Add final line
+        const line = document.createElement("div");
         line.textContent = data.text;
+        el.appendChild(line);
       } else {
-        line.innerHTML = `<em style="color:#666">${data.text}</em>`;
+        // Replace existing partial or create one
+        let partial = el.querySelector(".partial");
+        if (!partial) {
+          partial = document.createElement("div");
+          partial.className = "partial";
+          partial.style.color = "#666";
+          partial.style.fontStyle = "italic";
+          el.appendChild(partial);
+        }
+        partial.textContent = data.text;
       }
-      el.appendChild(line);
 
-      // Keep only last 20 lines
-      while (el.children.length > 20) el.removeChild(el.firstChild);
+      // Keep only last 20 final lines
+      const finals = el.querySelectorAll("div:not(.partial)");
+      while (finals.length > 20) el.removeChild(finals[0]);
       el.scrollTop = el.scrollHeight;
     } catch {}
   };
@@ -602,9 +615,9 @@ function startPolling() {
         statusBar.textContent =
           `${bots.length} bot(s) | ${active.length} active | ${inBreakout.length} in breakout rooms`;
 
-        // Fallback: poll transcripts in case webhook doesn't deliver
+        // Poll transcripts only for FINISHED bots (live bots use WebSocket)
         for (const bot of bots) {
-          if (!["done", "fatal"].includes(bot.status)) {
+          if (["done"].includes(bot.status)) {
             updateTranscript(bot.id);
           }
         }
@@ -617,7 +630,7 @@ function startPolling() {
     } catch {
       // Ignore polling errors
     }
-  }, 5000);
+  }, 2000);
 }
 
 function stopPolling() {

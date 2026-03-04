@@ -330,10 +330,8 @@ app.post("/api/bots/deactivate-output-media", async (_req, res) => {
 // ── WebSocket server for Output Media pages ─────────────────────────
 
 const server = createServer(app);
-const wss = new WebSocketServer({ server, path: "/ws/output-media" });
-
-// Separate WebSocket for the renderer to push frames directly (no HTTP overhead)
-const wssPush = new WebSocketServer({ server, path: "/ws/frame-push" });
+const wss = new WebSocketServer({ noServer: true });
+const wssPush = new WebSocketServer({ noServer: true });
 
 wssPush.on("connection", (ws) => {
   console.log("[ws] Frame push client connected (renderer)");
@@ -363,7 +361,7 @@ wssPush.on("connection", (ws) => {
 });
 
 // ── WebSocket for gapless audio streaming (mic → ffmpeg → MP3 → Recall API) ──
-const wssAudio = new WebSocketServer({ server, path: "/ws/audio-push" });
+const wssAudio = new WebSocketServer({ noServer: true });
 
 wssAudio.on("connection", (ws) => {
   console.log("[ws-audio] Audio push client connected");
@@ -447,7 +445,7 @@ wssAudio.on("connection", (ws) => {
 });
 
 // ── WebSocket for real-time transcript push to renderer ──────────────
-const wssTranscript = new WebSocketServer({ server, path: "/ws/transcript" });
+const wssTranscript = new WebSocketServer({ noServer: true });
 const transcriptClients = new Set<WebSocket>();
 
 wssTranscript.on("connection", (ws) => {
@@ -468,15 +466,63 @@ function pushTranscriptToClients(data: any) {
   }
 }
 
-// ── Webhook: real-time transcription from Recall.ai ──────────────────
+// ── WebSocket: real-time transcription FROM Recall.ai (bot connects here) ──
+const wssRecallTranscript = new WebSocketServer({ noServer: true });
+
+wssRecallTranscript.on("connection", (ws, req) => {
+  console.log("[recall-ws] Recall bot connected for transcript streaming");
+
+  ws.on("message", (raw) => {
+    try {
+      const event = JSON.parse(raw.toString());
+      const eventType = event.event; // "transcript.data" or "transcript.partial_data"
+      // Payload is nested: event.data.data.words, event.data.bot.id
+      const outer = event.data || {};
+      const inner = outer.data || {};
+      console.log(`[recall-ws] ${eventType || "unknown"} — ${JSON.stringify(event).slice(0, 300)}`);
+
+      // Find local bot ID by matching recallBotId
+      const recallBotId = outer.bot?.id || event.bot_id;
+      let localBotId: string | null = null;
+      for (const [id, bot] of bots) {
+        if (bot.recallBotId === recallBotId) {
+          localBotId = id;
+          break;
+        }
+      }
+
+      const words = inner.words || outer.words || [];
+      const text = words.map((w: any) => w.text).join(" ") || inner.text || outer.text || "";
+      const isFinal = eventType === "transcript.data";
+
+      if (text.trim()) {
+        pushTranscriptToClients({
+          botId: localBotId || recallBotId,
+          speaker: "",
+          text,
+          is_final: isFinal,
+        });
+      }
+    } catch (err) {
+      console.error("[recall-ws] Parse error:", err);
+    }
+  });
+
+  ws.on("close", () => console.log("[recall-ws] Recall bot disconnected"));
+  ws.on("error", (err) => console.error("[recall-ws] Error:", err));
+});
+
+// ── Webhook fallback: real-time transcription from Recall.ai ─────────
 app.post("/webhook/transcription", express.json(), (req, res) => {
   const event = req.body;
   const eventType = event.event; // "transcript.data" or "transcript.partial_data"
-  const data = event.data || {};
+  // Payload is nested: event.data.data.words, event.data.bot.id
+  const outer = event.data || {};
+  const inner = outer.data || {};
   console.log(`[transcript-webhook] ${eventType || "unknown"} — ${JSON.stringify(event).slice(0, 300)}`);
 
   // Find local bot ID by matching recallBotId
-  const recallBotId = data.bot?.id || event.bot_id;
+  const recallBotId = outer.bot?.id || event.bot_id;
   let localBotId: string | null = null;
   for (const [id, bot] of bots) {
     if (bot.recallBotId === recallBotId) {
@@ -485,15 +531,14 @@ app.post("/webhook/transcription", express.json(), (req, res) => {
     }
   }
 
-  const speaker = data.participant?.name || "?";
-  const words = data.words || [];
-  const text = words.map((w: any) => w.text).join(" ") || data.text || "";
+  const words = inner.words || outer.words || [];
+  const text = words.map((w: any) => w.text).join(" ") || inner.text || outer.text || "";
   const isFinal = eventType === "transcript.data";
 
   if (text.trim()) {
     pushTranscriptToClients({
       botId: localBotId || recallBotId,
-      speaker,
+      speaker: "",
       text,
       is_final: isFinal,
     });
@@ -1073,11 +1118,12 @@ app.post("/api/bots/deploy", async (req, res) => {
       },
     };
 
-    // Real-time transcription webhook (requires tunnel)
+    // Real-time transcription via WebSocket (persistent connection, lowest latency)
     if (tunnelHttpUrl) {
+      const tunnelWsUrl = tunnelHttpUrl.replace("https://", "wss://").replace("http://", "ws://");
       botPayload.recording_config.realtime_endpoints.push({
-        type: "webhook",
-        url: `${tunnelHttpUrl}/webhook/transcription`,
+        type: "websocket",
+        url: `${tunnelWsUrl}/ws/recall-transcript`,
         events: ["transcript.data", "transcript.partial_data"],
       });
     }
@@ -1640,24 +1686,14 @@ app.get("/api/bots/:id/transcript", async (req, res) => {
     const transcripts = data.results || [];
     const allSegments: any[] = [];
 
-    // Fetch transcript data from all available download URLs
-    for (const t of transcripts) {
-      if (t.status?.code === "done" && t.data?.download_url) {
-        try {
-          const dlRes = await fetch(t.data.download_url);
-          if (dlRes.ok) {
-            const segments = await dlRes.json();
-            if (Array.isArray(segments)) {
-              allSegments.push(...segments);
-            }
-          }
-        } catch {}
-      }
-    }
+    // Only fetch transcripts created AFTER this bot was deployed
+    const botCreatedAt = new Date(bot.createdAt).getTime();
+    const currentSession = transcripts.filter((t: any) =>
+      new Date(t.created_at || 0).getTime() >= botCreatedAt - 5000
+    );
 
-    // Also check the "processing" transcript (current live session)
-    for (const t of transcripts) {
-      if (t.status?.code === "processing" && t.data?.download_url) {
+    for (const t of currentSession) {
+      if (t.data?.download_url) {
         try {
           const dlRes = await fetch(t.data.download_url);
           if (dlRes.ok) {
@@ -1790,6 +1826,25 @@ async function cleanup() {
 
 process.on("SIGINT", cleanup);
 process.on("SIGTERM", cleanup);
+
+// ── WebSocket upgrade routing (noServer mode) ───────────────────────
+server.on("upgrade", (req, socket, head) => {
+  const pathname = new URL(req.url!, `http://localhost`).pathname;
+
+  if (pathname === "/ws/output-media") {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
+  } else if (pathname === "/ws/frame-push") {
+    wssPush.handleUpgrade(req, socket, head, (ws) => wssPush.emit("connection", ws, req));
+  } else if (pathname === "/ws/audio-push") {
+    wssAudio.handleUpgrade(req, socket, head, (ws) => wssAudio.emit("connection", ws, req));
+  } else if (pathname === "/ws/transcript") {
+    wssTranscript.handleUpgrade(req, socket, head, (ws) => wssTranscript.emit("connection", ws, req));
+  } else if (pathname === "/ws/recall-transcript") {
+    wssRecallTranscript.handleUpgrade(req, socket, head, (ws) => wssRecallTranscript.emit("connection", ws, req));
+  } else {
+    socket.destroy();
+  }
+});
 
 // ── Start server ────────────────────────────────────────────────────
 
