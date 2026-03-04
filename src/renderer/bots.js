@@ -183,7 +183,7 @@ btnRemoveAll.addEventListener("click", async () => {
   statusBar.textContent = "Removing all bots...";
 
   try {
-    deactivateAllOutputs();
+    await deactivateAllOutputsAndApi();
     await bridge.removeAllBots();
     stopPolling();
     activeBots = [];
@@ -204,7 +204,7 @@ btnForceRemove.addEventListener("click", async () => {
   statusBar.textContent = "Force removing ALL bots from Recall.ai...";
 
   try {
-    deactivateAllOutputs();
+    await deactivateAllOutputsAndApi();
     const result = await bridge.forceRemoveAllBots();
     stopPolling();
     activeBots = [];
@@ -609,31 +609,31 @@ function stopAudioStream() {
 // output_media (Camera, URL) and output_video (Image) are mutually exclusive.
 // Audio is also exclusive with output_media. Turning one ON turns the others OFF.
 
+// Clean up UI + local streams only (no API call — avoids race conditions)
 function deactivateAllOutputs() {
-  // Always DELETE output_media on the Recall API to guarantee clean slate
-  bridge.deactivateOutputMedia().catch(() => {});
-
-  // Camera
   if (toggleCamera.classList.contains("on")) {
     stopCamera();
     showPreview("none");
   }
-  // Image
   if (toggleImage.classList.contains("on")) {
     toggleImage.classList.remove("on");
     indImage.classList.remove("active");
     showPreview("none");
   }
-  // URL
   if (toggleUrl.classList.contains("on")) {
     toggleUrl.classList.remove("on");
     indUrl.classList.remove("active");
     showPreview("none");
   }
-  // Audio (exclusive with output_media)
   if (toggleAudio.classList.contains("on")) {
     stopAudioStream();
   }
+}
+
+// Full cleanup: UI + DELETE output_media on Recall API
+async function deactivateAllOutputsAndApi() {
+  deactivateAllOutputs();
+  await bridge.deactivateOutputMedia().catch(() => {});
 }
 
 // ── Camera toggle ─────────────────────────────────────────────────────
@@ -651,7 +651,7 @@ cameraSource.addEventListener("change", async () => {
 
 toggleCamera.addEventListener("click", async () => {
   if (toggleCamera.classList.contains("on")) {
-    deactivateAllOutputs();
+    await deactivateAllOutputsAndApi();
     statusBar.textContent = "Camera feed cleared";
     return;
   }
@@ -773,7 +773,7 @@ btnPickImage.addEventListener("click", () => {
 
 toggleImage.addEventListener("click", async () => {
   if (toggleImage.classList.contains("on")) {
-    deactivateAllOutputs();
+    await deactivateAllOutputsAndApi();
     statusBar.textContent = "Image feed cleared";
   } else if (pendingImageB64) {
     // ON = broadcast the current image (turns off others first)
@@ -827,7 +827,7 @@ async function pushUrlToBots() {
 
 toggleUrl.addEventListener("click", async () => {
   if (toggleUrl.classList.contains("on")) {
-    deactivateAllOutputs();
+    await deactivateAllOutputsAndApi();
     statusBar.textContent = "URL feed cleared";
     return;
   }
@@ -856,7 +856,7 @@ toggleScreenshare.addEventListener("click", () => {
 
 toggleAudio.addEventListener("click", async () => {
   if (toggleAudio.classList.contains("on")) {
-    deactivateAllOutputs();
+    await deactivateAllOutputsAndApi();
     statusBar.textContent = "Audio feed cleared";
     return;
   }
