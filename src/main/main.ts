@@ -1,5 +1,5 @@
 import { app, BrowserWindow, ipcMain, systemPreferences, dialog, desktopCapturer } from "electron";
-import { exec } from "node:child_process";
+import { exec, spawn, ChildProcess } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
 
@@ -7,6 +7,34 @@ import fs from "node:fs";
 const RecallAiSdk = require("@recallai/desktop-sdk");
 
 const BACKEND_URL = "http://localhost:3000";
+
+let serverProcess: ChildProcess | null = null;
+
+function startBackendServer() {
+  if (serverProcess) return;
+  const serverScript = path.join(__dirname, "..", "..", "src", "server", "index.ts");
+  serverProcess = spawn("npx", ["tsx", serverScript], {
+    cwd: path.join(__dirname, "..", ".."),
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env },
+  });
+  serverProcess.stdout?.on("data", (d: Buffer) => process.stdout.write(`[server] ${d}`));
+  serverProcess.stderr?.on("data", (d: Buffer) => process.stderr.write(`[server] ${d}`));
+  serverProcess.on("exit", (code) => {
+    console.log(`[main] Server exited with code ${code}`);
+    serverProcess = null;
+  });
+  console.log("[main] Backend server started");
+}
+
+function stopBackendServer() {
+  if (serverProcess) {
+    // Send SIGTERM so server can clean up bots before dying
+    serverProcess.kill("SIGTERM");
+    serverProcess = null;
+    console.log("[main] Backend server stopping (SIGTERM)");
+  }
+}
 
 let lastDetectedMeeting: { title: string; windowId: string | null } | null = null;
 let currentWindowId: string | null = null;
@@ -26,8 +54,8 @@ function loadToggles(): FeatureToggles {
       return JSON.parse(fs.readFileSync(SETTINGS_PATH, "utf-8"));
     }
   } catch {}
-  // Both OFF by default — nothing runs, nothing bills
-  return { desktopSdk: false, botFleet: false };
+  // Bot Fleet ON by default so Deploy works immediately
+  return { desktopSdk: false, botFleet: true };
 }
 
 function saveToggles(toggles: FeatureToggles): void {
@@ -128,7 +156,7 @@ function initDesktopSdk(win: BrowserWindow) {
 function createWindow() {
   const win = new BrowserWindow({
     width: 960,
-    height: 720,
+    height: 860,
     backgroundColor: "#000000",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -137,7 +165,7 @@ function createWindow() {
     },
   });
 
-  win.loadFile(path.join(__dirname, "..", "renderer", "index.html"));
+  win.loadFile(path.join(__dirname, "..", "renderer", "bots.html"));
 
   win.webContents.on("did-finish-load", () => {
     console.log("[main] Renderer loaded");
@@ -154,6 +182,9 @@ function createWindow() {
 // ── App ready ────────────────────────────────────────────────────────
 
 app.whenReady().then(async () => {
+  // Auto-start backend server
+  startBackendServer();
+
   const win = createWindow();
   console.log("[main] Window created");
   console.log(`[main] Toggles: Desktop SDK=${toggles.desktopSdk}, Bot Fleet=${toggles.botFleet}`);
@@ -431,6 +462,52 @@ app.whenReady().then(async () => {
 
   // ── Output Media (30fps webpage mode) ──────────────────────────────
 
+  ipcMain.handle("start-output-media", async (_event, botId: string, url: string) => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots/${botId}/start-output-media`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
+  ipcMain.handle("stop-output-media", async (_event, botId: string) => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots/${botId}/stop-output-media`, {
+        method: "POST",
+      });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
+  ipcMain.handle("activate-output-media", async () => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots/activate-output-media`, { method: "POST" });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
+  ipcMain.handle("deactivate-output-media", async () => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots/deactivate-output-media`, { method: "POST" });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
   ipcMain.handle("get-ngrok-status", async () => {
     try {
       const res = await fetch(`${BACKEND_URL}/api/ngrok-status`);
@@ -456,5 +533,7 @@ app.whenReady().then(async () => {
 });
 
 app.on("window-all-closed", () => {
+  // Server's SIGTERM handler will clean up bots
+  stopBackendServer();
   app.quit();
 });

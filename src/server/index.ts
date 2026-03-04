@@ -42,6 +42,70 @@ interface BotRecord {
 const bots = new Map<string, BotRecord>();
 let botCounter = 0; // Global counter for unique bot IDs across deploys
 
+// Recover active bots from Recall API on startup
+async function recoverBots() {
+  const activeStatuses = [
+    "joining_call",
+    "in_waiting_room",
+    "in_call_not_recording",
+    "in_call_recording",
+    "recording_permission_allowed",
+    "in_breakout_room",
+  ];
+
+  let recovered = 0;
+  const seenRecallIds = new Set<string>();
+
+  for (const status of activeStatuses) {
+    try {
+      const listRes = await fetch(
+        `${BASE_URL}/api/v1/bot/?status_code=${status}&limit=100`,
+        { headers: { Authorization: `Token ${API_KEY}` } }
+      );
+      if (!listRes.ok) continue;
+
+      const data = await listRes.json();
+      const results = data.results || data || [];
+
+      for (const bot of results) {
+        // Skip duplicates (same bot could appear across status queries)
+        if (seenRecallIds.has(bot.id)) continue;
+        seenRecallIds.add(bot.id);
+
+        // Skip if already tracked locally
+        const alreadyTracked = Array.from(bots.values()).some(
+          (b) => b.recallBotId === bot.id
+        );
+        if (alreadyTracked) continue;
+
+        // Check actual latest status — skip terminal bots
+        const latestStatus =
+          bot.status_changes?.[bot.status_changes.length - 1]?.code || status;
+        const normalizedStatus = latestStatus.replace("bot.", "");
+        const terminalStatuses = ["done", "fatal", "media_expired", "analysis_done", "call_ended"];
+        if (terminalStatuses.includes(normalizedStatus)) continue;
+
+        const localId = `recovered-${++botCounter}`;
+        bots.set(localId, {
+          id: localId,
+          recallBotId: bot.id,
+          name: bot.bot_name || "Recovered Bot",
+          status: normalizedStatus,
+          breakoutRoom: null,
+          meetingUrl: bot.meeting_url || "",
+          createdAt: bot.created_at || new Date().toISOString(),
+        });
+        recovered++;
+        console.log(`[bot] Recovered: ${bot.bot_name} (${bot.id}) status=${latestStatus}`);
+      }
+    } catch {}
+  }
+
+  if (recovered > 0) {
+    console.log(`[server] Recovered ${recovered} active bot(s) from Recall API`);
+  }
+}
+
 // 1-pixel silent JPEG for enabling automatic_video_output (API fallback)
 const SILENT_JPEG =
   "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AKwA//9k=";
@@ -122,6 +186,70 @@ app.get("/api/ngrok-status", async (_req, res) => {
     rtmpAvailable: !!ngrokTcpUrl,
     rtmpUrl: ngrokTcpUrl,
   });
+});
+
+// Helper: set output_media on a bot (DELETE old first, then POST new)
+async function setOutputMedia(bot: BotRecord, pageUrl: string): Promise<boolean> {
+  const endpoint = `${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_media/`;
+  const headers: Record<string, string> = {
+    Authorization: `Token ${API_KEY}`,
+    "Content-Type": "application/json",
+  };
+  // Always DELETE first to clear any existing output_media
+  try {
+    await fetch(endpoint, {
+      method: "DELETE",
+      headers,
+      body: JSON.stringify({ camera: true }),
+    });
+  } catch {}
+  // Now POST the new one
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ camera: { kind: "webpage", config: { url: pageUrl } } }),
+  });
+  return response.ok;
+}
+
+// Activate output_media on all active bots (uses tunnel URL)
+app.post("/api/bots/activate-output-media", async (_req, res) => {
+  if (!tunnelHttpUrl) {
+    res.status(503).json({ error: "No tunnel available" });
+    return;
+  }
+  let activated = 0;
+  for (const [, bot] of bots) {
+    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    try {
+      const url = `${tunnelHttpUrl}/output-media?bot=${bot.id}`;
+      if (await setOutputMedia(bot, url)) {
+        activated++;
+        console.log(`[bot] ${bot.id} output_media activated: ${url}`);
+      }
+    } catch {}
+  }
+  res.json({ ok: true, activated });
+});
+
+// Deactivate output_media on all active bots
+app.post("/api/bots/deactivate-output-media", async (_req, res) => {
+  let deactivated = 0;
+  for (const [, bot] of bots) {
+    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    try {
+      const response = await fetch(
+        `${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_media/`,
+        {
+          method: "DELETE",
+          headers: { Authorization: `Token ${API_KEY}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ camera: true }),
+        }
+      );
+      if (response.ok) deactivated++;
+    } catch {}
+  }
+  res.json({ ok: true, deactivated });
 });
 
 // ── WebSocket server for Output Media pages ─────────────────────────
@@ -354,6 +482,10 @@ app.post("/api/output-media/stream", express.raw({ type: "*/*", limit: "5mb" }),
 
 app.post("/api/output-media/stream-stop", (_req, res) => {
   stopFfmpegHls();
+  // Clear cached frames so new connections don't get stale data
+  latestFrameB64 = null;
+  latestFrameVersion = 0;
+  lastFrame = null;
   res.json({ ok: true });
 });
 
@@ -615,20 +747,21 @@ app.post("/api/bots/deploy", async (req, res) => {
       console.log(`[bot] ${localId} RTMP stream → ${rtmpUrl}`);
     }
 
-    // Output media webpage (30fps via cloudflared)
+    // Output media NOT set at creation — activated on demand when user starts feeding
+    // Use start-output-media endpoint or the tunnel URL when camera/image is toggled on
     if (tunnelHttpUrl) {
-      botPayload.output_media = {
-        camera: {
-          kind: "webpage",
-          config: {
-            url: `${tunnelHttpUrl}/output-media?bot=${localId}`,
-          },
-        },
-      };
-      console.log(`[bot] ${localId} camera: webpage via ${tunnelHttpUrl}`);
-    } else {
-      console.log(`[bot] ${localId} WARNING: no tunnel — bot camera will be black`);
+      console.log(`[bot] ${localId} ready — output_media available via ${tunnelHttpUrl}`);
     }
+    botPayload.automatic_video_output = {
+      in_call_recording: {
+        kind: "jpeg" as const,
+        b64_data: SILENT_JPEG,
+      },
+      in_call_not_recording: {
+        kind: "jpeg" as const,
+        b64_data: SILENT_JPEG,
+      },
+    };
     botPayload.automatic_audio_output = {
       in_call_recording: {
         data: { kind: "mp3" as const, b64_data: SILENT_MP3 },
@@ -762,6 +895,57 @@ app.post("/api/bots/:id/leave", async (req, res) => {
   }
 });
 
+// ── Start output media (URL as bot camera) ───────────────────────────
+app.post("/api/bots/:id/start-output-media", async (req, res) => {
+  const bot = bots.get(req.params.id);
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
+
+  const { url } = req.body;
+  if (!url) { res.status(400).json({ error: "url required" }); return; }
+
+  try {
+    if (await setOutputMedia(bot, url)) {
+      console.log(`[bot] ${bot.id} output_media started: ${url}`);
+      res.json({ ok: true });
+    } else {
+      res.status(502).json({ error: "Failed to set output_media" });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── Stop output media ────────────────────────────────────────────────
+app.post("/api/bots/:id/stop-output-media", async (req, res) => {
+  const bot = bots.get(req.params.id);
+  if (!bot) { res.status(404).json({ error: "Bot not found" }); return; }
+
+  try {
+    const response = await fetch(
+      `${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_media/`,
+      {
+        method: "DELETE",
+        headers: {
+          Authorization: `Token ${API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ camera: true }),
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      res.status(502).json({ error: text });
+      return;
+    }
+
+    console.log(`[bot] ${bot.id} output_media stopped`);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post("/api/bots/remove-all", async (_req, res) => {
   const results: { id: string; ok: boolean; error?: string }[] = [];
 
@@ -776,12 +960,15 @@ app.post("/api/bots/remove-all", async (_req, res) => {
           headers: { Authorization: `Token ${API_KEY}` },
         }
       );
-      bot.status = "leaving";
       results.push({ id: bot.id, ok: true });
     } catch (err: any) {
       results.push({ id: bot.id, ok: false, error: err.message });
     }
   }
+
+  // Clear local state so new deploys start fresh
+  bots.clear();
+  botCounter = 0;
 
   res.json({ results });
 });
@@ -901,12 +1088,31 @@ app.post("/api/bots/broadcast-image", async (req, res) => {
     return;
   }
 
-  // Push to SSE — all bot output_media pages receive this instantly
-  pushFrameToSSE(b64_data);
-  latestFrameB64 = b64_data;
-  latestFrameVersion++;
+  // Push JPEG directly via output_video API to each active bot
+  let sent = 0;
+  let errors = 0;
+  const promises: Promise<void>[] = [];
+  for (const [, bot] of bots) {
+    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    promises.push(
+      fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`, {
+        method: "POST",
+        headers: {
+          Authorization: `Token ${API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ kind: "jpeg", b64_data }),
+      })
+        .then(async (r) => {
+          if (r.ok) { sent++; console.log(`[bot] output_video OK for ${bot.id}`); }
+          else { errors++; const t = await r.text(); console.error(`[bot] output_video FAILED for ${bot.id}: ${r.status} ${t}`); }
+        })
+        .catch((e) => { errors++; console.error(`[bot] output_video ERROR for ${bot.id}: ${e.message}`); })
+    );
+  }
+  await Promise.all(promises);
 
-  res.json({ ok: true, sseClients: sseClients.size, mode: "webpage" });
+  res.json({ ok: true, sent, errors, mode: "api" });
 });
 
 app.post("/api/bots/:id/send-audio", async (req, res) => {
@@ -1209,7 +1415,10 @@ process.on("SIGTERM", cleanup);
 server.listen(PORT, async () => {
   console.log(`[server] Backend running on http://localhost:${PORT}`);
 
-  // Don't auto-cleanup on startup (too slow, kills newly deployed bots)
+  // Recover any active bots from Recall API (e.g. after accidental crash)
+  recoverBots().catch((err) =>
+    console.error("[server] Bot recovery failed:", err)
+  );
 
   // Start RTMP server
   nms.run();
@@ -1236,4 +1445,34 @@ server.listen(PORT, async () => {
       console.log(`[server] RTMP via ngrok: ${ngrokTcpUrl.replace("tcp://", "rtmp://")}/live/{bot-id}`);
     }
   });
+});
+
+// ── Graceful shutdown: remove all bots on SIGTERM/SIGINT ─────────────
+async function cleanupBots() {
+  if (bots.size === 0) return;
+  console.log(`[server] Cleaning up ${bots.size} bot(s) before exit...`);
+  const promises: Promise<void>[] = [];
+  for (const [, bot] of bots) {
+    if (["done", "fatal"].includes(bot.status)) continue;
+    promises.push(
+      fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/leave_call/`, {
+        method: "POST",
+        headers: { Authorization: `Token ${API_KEY}` },
+      })
+        .then(() => console.log(`[server] Removed ${bot.name} (${bot.id})`))
+        .catch(() => {})
+    );
+  }
+  await Promise.all(promises);
+  console.log("[server] All bots cleaned up");
+}
+
+process.on("SIGTERM", async () => {
+  await cleanupBots();
+  process.exit(0);
+});
+
+process.on("SIGINT", async () => {
+  await cleanupBots();
+  process.exit(0);
 });

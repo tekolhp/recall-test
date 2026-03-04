@@ -3,7 +3,7 @@ const meetingUrlInput = document.getElementById("meeting-url");
 const namePrefixInput = document.getElementById("name-prefix");
 const botCountSelect = document.getElementById("bot-count");
 const btnDeploy = document.getElementById("btn-deploy");
-const btnBroadcast = document.getElementById("btn-broadcast");
+// btnBroadcast removed from UI
 const btnRemoveAll = document.getElementById("btn-remove-all");
 const statusBar = document.getElementById("status-bar");
 const botGrid = document.getElementById("bot-grid");
@@ -21,13 +21,28 @@ const modalSend = document.getElementById("modal-send");
 const streamPanel = document.getElementById("stream-panel");
 const streamVideo = document.getElementById("stream-video");
 const streamCanvas = document.getElementById("stream-canvas");
-const videoSourceSelect = document.getElementById("video-source");
-const btnStartVideo = document.getElementById("btn-start-video");
-const btnStopVideo = document.getElementById("btn-stop-video");
-const btnStartAudio = document.getElementById("btn-start-audio");
-const btnStopAudio = document.getElementById("btn-stop-audio");
+const streamImage = document.getElementById("stream-image");
+const previewPlaceholder = document.getElementById("preview-placeholder");
 const streamInfo = document.getElementById("stream-info");
 const btnForceRemove = document.getElementById("btn-force-remove");
+
+// Output feature controls
+const cameraSource = document.getElementById("camera-source");
+const toggleCamera = document.getElementById("toggle-camera");
+const indCamera = document.getElementById("ind-camera");
+const btnPickImage = document.getElementById("btn-pick-image");
+const toggleImage = document.getElementById("toggle-image");
+const indImage = document.getElementById("ind-image");
+const toggleVideo = document.getElementById("toggle-video");
+const indVideo = document.getElementById("ind-video");
+const toggleScreenshare = document.getElementById("toggle-screenshare");
+const indScreenshare = document.getElementById("ind-screenshare");
+const urlInput = document.getElementById("url-input");
+const btnSendUrl = document.getElementById("btn-send-url");
+const toggleUrl = document.getElementById("toggle-url");
+const indUrl = document.getElementById("ind-url");
+const toggleAudio = document.getElementById("toggle-audio");
+const indAudio = document.getElementById("ind-audio");
 
 let activeBots = [];
 let pollInterval = null;
@@ -49,6 +64,24 @@ let outputMediaMode = false;
 let pushSocket = null; // Direct WebSocket to server for frame pushing
 
 const bridge = window.recallBridge;
+
+// ── Preview management ───────────────────────────────────────────────
+// Shows the correct preview element based on active output type
+function showPreview(type) {
+  streamVideo.classList.remove("active");
+  streamImage.classList.remove("active");
+  previewPlaceholder.classList.remove("hidden");
+
+  if (type === "camera") {
+    streamVideo.classList.add("active");
+    previewPlaceholder.classList.add("hidden");
+  } else if (type === "image") {
+    streamImage.classList.add("active");
+    previewPlaceholder.classList.add("hidden");
+  } else if (type === "none") {
+    // Show placeholder
+  }
+}
 
 // ── Check tunnel status ──────────────────────────────────────────────
 async function checkNgrokStatus() {
@@ -86,8 +119,8 @@ if (bridge.onToggleState) {
     if (disabled) {
       statusBar.textContent = "Bot Fleet is OFF — enable it with the toggle above";
       // Stop streams if running
-      if (videoStream) btnStopVideo.click();
-      if (audioRecorder) btnStopAudio.click();
+      if (videoStream) stopCamera();
+      if (audioRecorder) stopAudioStream();
     }
   });
   // Check initial state
@@ -125,15 +158,17 @@ btnDeploy.addEventListener("click", async () => {
     activeBots = result.created || [];
     outputMediaMode = result.mode === "webpage";
     const modeLabel = outputMediaMode ? "Webpage 30fps" : "API 5fps";
-    statusBar.textContent =
-      `Deployed ${activeBots.length} bot(s) [${modeLabel}]` +
-      (result.errors?.length ? ` (${result.errors.length} failed)` : "");
+    if (result.errors?.length && activeBots.length === 0) {
+      statusBar.textContent = `Deploy failed: ${result.errors[0].error}`;
+    } else {
+      statusBar.textContent =
+        `Deployed ${activeBots.length} bot(s) [${modeLabel}]` +
+        (result.errors?.length ? ` (${result.errors.length} failed: ${result.errors[0].error})` : "");
+    }
 
     renderBots();
     startPolling();
-    btnBroadcast.disabled = false;
     btnRemoveAll.disabled = false;
-    streamPanel.classList.add("active");
   } catch (err) {
     statusBar.textContent = `Deploy failed: ${err.message}`;
   } finally {
@@ -148,17 +183,12 @@ btnRemoveAll.addEventListener("click", async () => {
   statusBar.textContent = "Removing all bots...";
 
   try {
+    deactivateAllOutputs();
     await bridge.removeAllBots();
     stopPolling();
-    // Stop any active streams
-    btnStopVideo.click();
-    btnStopAudio.click();
-    streamPanel.classList.remove("active");
-
     activeBots = [];
     renderBots();
     statusBar.textContent = "All bots removed";
-    btnBroadcast.disabled = true;
     btnRemoveAll.disabled = true;
   } catch (err) {
     statusBar.textContent = `Remove failed: ${err.message}`;
@@ -174,14 +204,11 @@ btnForceRemove.addEventListener("click", async () => {
   statusBar.textContent = "Force removing ALL bots from Recall.ai...";
 
   try {
+    deactivateAllOutputs();
     const result = await bridge.forceRemoveAllBots();
     stopPolling();
-    btnStopVideo.click();
-    btnStopAudio.click();
-    streamPanel.classList.remove("active");
     activeBots = [];
     renderBots();
-    btnBroadcast.disabled = true;
     btnRemoveAll.disabled = true;
 
     statusBar.textContent = result.error
@@ -196,11 +223,7 @@ btnForceRemove.addEventListener("click", async () => {
 });
 
 // ── Broadcast ─────────────────────────────────────────────────────────
-btnBroadcast.addEventListener("click", () => {
-  modalTargetBotId = null;
-  modalTitle.textContent = "Broadcast Image to All Bots";
-  openModal();
-});
+// Broadcast via Image feature row now
 
 // ── Image Modal ───────────────────────────────────────────────────────
 function openModal() {
@@ -284,59 +307,44 @@ function loadImageFile(file) {
       const jpegDataUrl = canvas.toDataURL("image/jpeg", 0.95);
       pendingImageB64 = jpegDataUrl.split(",")[1];
       modalSend.disabled = false;
+
+      // Auto-push if image toggle is already ON
+      if (toggleImage.classList.contains("on")) {
+        broadcastCurrentImage();
+      }
     };
     img.src = dataUrl;
   };
   reader.readAsDataURL(file);
 }
 
+async function broadcastCurrentImage() {
+  if (!pendingImageB64) return;
+  try {
+    const result = await bridge.broadcastImage(pendingImageB64);
+    streamImage.src = `data:image/jpeg;base64,${pendingImageB64}`;
+    showPreview("image");
+    toggleImage.classList.add("on");
+    indImage.classList.add("active");
+    statusBar.textContent = result.error
+      ? `Broadcast failed: ${result.error}`
+      : `Image sent to ${result.sent} bot(s)`;
+  } catch (err) {
+    statusBar.textContent = `Broadcast failed: ${err.message}`;
+  }
+}
+
 modalSend.addEventListener("click", async () => {
   if (!pendingImageB64) return;
-
   modalSend.disabled = true;
   modalSend.textContent = "Sending...";
-
-  try {
-    if (modalTargetBotId) {
-      const result = await bridge.sendImageToBot(
-        modalTargetBotId,
-        pendingImageB64
-      );
-      if (result.error) {
-        statusBar.textContent = `Send failed: ${result.error}`;
-      } else {
-        statusBar.textContent = `Sent image to ${modalTargetBotId}`;
-        updateTilePreview(modalTargetBotId, pendingImageB64);
-      }
-    } else {
-      const result = await bridge.broadcastImage(pendingImageB64);
-      if (result.error) {
-        statusBar.textContent = `Broadcast failed: ${result.error}`;
-      } else {
-        statusBar.textContent = `Broadcast image to ${result.sent} bot(s)`;
-        for (const bot of activeBots) {
-          updateTilePreview(bot.id, pendingImageB64);
-        }
-      }
-    }
-  } catch (err) {
-    statusBar.textContent = `Send failed: ${err.message}`;
-  }
-
+  await broadcastCurrentImage();
   modalSend.textContent = "Send";
   closeModal();
 });
 
 function updateTilePreview(botId, b64) {
-  const preview = document.getElementById(`preview-${botId}`);
-  if (!preview) return;
-  const img = preview.querySelector("img");
-  const placeholder = preview.querySelector("span");
-  if (img) {
-    img.src = `data:image/jpeg;base64,${b64}`;
-    img.style.display = "block";
-  }
-  if (placeholder) placeholder.style.display = "none";
+  // Bot tiles no longer have previews — no-op
 }
 
 // ── Render bot tiles ──────────────────────────────────────────────────
@@ -374,7 +382,7 @@ function renderBots() {
   }
 }
 
-// Track HLS players per bot for cleanup
+// HLS players (kept for potential future use)
 const hlsPlayers = new Map();
 
 function createBotTile(bot) {
@@ -382,36 +390,26 @@ function createBotTile(bot) {
   tile.className = "bot-tile";
   tile.dataset.botId = bot.id;
 
+  const isActive = !["done", "fatal", "leaving"].includes(bot.status);
+
   tile.innerHTML = `
-    <div class="bot-tile-header">
-      <span class="bot-tile-name">${bot.name}</span>
-      <span class="bot-tile-status ${bot.status}">${formatStatus(bot.status)}</span>
-    </div>
-    <div class="bot-tile-preview" id="preview-${bot.id}">
-      <video id="hls-${bot.id}" muted autoplay playsinline style="width:100%;height:100%;object-fit:contain;display:none;"></video>
-      <img />
-      <span>Waiting for stream...</span>
-    </div>
-    <div class="bot-tile-transcript" id="transcript-${bot.id}"></div>
-    <div class="bot-tile-actions">
-      <button class="btn-send" data-bot-id="${bot.id}">Send Image</button>
-      <button class="btn-kick" data-bot-id="${bot.id}">Remove</button>
-    </div>
+    <span class="bot-tile-name">${bot.name}</span>
+    <span class="bot-tile-status-text">${formatStatus(bot.status)}</span>
+    <div class="bot-tile-indicator ${isActive ? "active" : ""}"></div>
+    <div class="feature-toggle ${isActive ? "on" : ""}" data-bot-id="${bot.id}"></div>
   `;
 
-  tile.querySelector(".btn-send").addEventListener("click", () => {
-    modalTargetBotId = bot.id;
-    modalTitle.textContent = `Send Image to ${bot.name}`;
-    openModal();
-  });
-
-  tile.querySelector(".btn-kick").addEventListener("click", async () => {
-    try {
-      destroyHlsPlayer(bot.id);
-      await bridge.removeBot(bot.id);
-      statusBar.textContent = `Removed ${bot.id}`;
-    } catch (err) {
-      statusBar.textContent = `Failed to remove ${bot.id}: ${err.message}`;
+  tile.querySelector(".feature-toggle").addEventListener("click", async () => {
+    const toggle = tile.querySelector(".feature-toggle");
+    if (toggle.classList.contains("on")) {
+      try {
+        toggle.classList.remove("on");
+        tile.querySelector(".bot-tile-indicator").classList.remove("active");
+        await bridge.removeBot(bot.id);
+        statusBar.textContent = `Disconnected ${bot.name}`;
+      } catch (err) {
+        statusBar.textContent = `Failed to disconnect ${bot.name}: ${err.message}`;
+      }
     }
   });
 
@@ -464,24 +462,24 @@ function destroyHlsPlayer(botId) {
 }
 
 function updateBotTile(tile, bot) {
-  const statusEl = tile.querySelector(".bot-tile-status");
-  statusEl.className = `bot-tile-status ${bot.status}`;
-  statusEl.textContent = formatStatus(bot.status);
-
   const nameEl = tile.querySelector(".bot-tile-name");
   nameEl.textContent = bot.breakoutRoom
     ? `${bot.name} — ${bot.breakoutRoom}`
     : bot.name;
 
-  // Start HLS player when bot is recording (RTMP stream should be active)
-  const recordingStatuses = ["in_call_recording", "recording_permission_allowed", "in_breakout_room"];
-  if (recordingStatuses.includes(bot.status)) {
-    tryStartHlsPlayer(bot.id);
-  }
+  const statusText = tile.querySelector(".bot-tile-status-text");
+  statusText.textContent = formatStatus(bot.status);
 
-  // Cleanup player when bot is done
-  if (["done", "fatal"].includes(bot.status)) {
-    destroyHlsPlayer(bot.id);
+  const isActive = !["done", "fatal", "leaving"].includes(bot.status);
+  const indicator = tile.querySelector(".bot-tile-indicator");
+  const toggle = tile.querySelector(".feature-toggle");
+
+  if (isActive) {
+    indicator.classList.add("active");
+    toggle.classList.add("on");
+  } else {
+    indicator.classList.remove("active");
+    toggle.classList.remove("on");
   }
 }
 
@@ -573,16 +571,98 @@ async function updateTranscript(botId) {
   }
 }
 
-// ── Real-time Video Streaming (HLS via MediaRecorder) ────────────────
+// ── Stop helpers (used by toggles and cleanup) ───────────────────────
+
+function stopCamera() {
+  stopVideoRecorder();
+  if (videoStream) {
+    videoStream.getTracks().forEach((t) => t.stop());
+    videoStream = null;
+  }
+  streamVideo.srcObject = null;
+  cameraSource.disabled = false;
+  bridge.streamStop();
+  toggleCamera.classList.remove("on");
+  indCamera.classList.remove("active");
+  updateStreamInfo();
+}
+
+function stopAudioStream() {
+  if (audioChunkInterval) {
+    clearInterval(audioChunkInterval);
+    audioChunkInterval = null;
+  }
+  if (audioRecorder) {
+    audioRecorder.stop();
+    audioRecorder = null;
+  }
+  if (audioStream) {
+    audioStream.getTracks().forEach((t) => t.stop());
+    audioStream = null;
+  }
+  toggleAudio.classList.remove("on");
+  indAudio.classList.remove("active");
+  updateStreamInfo();
+}
+
+// ── Mutual exclusion: only one video output at a time ─────────────────
+// output_media (Camera, URL) and output_video (Image) are mutually exclusive.
+// Audio is also exclusive with output_media. Turning one ON turns the others OFF.
+
+function deactivateAllOutputs() {
+  // Always DELETE output_media on the Recall API to guarantee clean slate
+  bridge.deactivateOutputMedia().catch(() => {});
+
+  // Camera
+  if (toggleCamera.classList.contains("on")) {
+    stopCamera();
+    showPreview("none");
+  }
+  // Image
+  if (toggleImage.classList.contains("on")) {
+    toggleImage.classList.remove("on");
+    indImage.classList.remove("active");
+    showPreview("none");
+  }
+  // URL
+  if (toggleUrl.classList.contains("on")) {
+    toggleUrl.classList.remove("on");
+    indUrl.classList.remove("active");
+    showPreview("none");
+  }
+  // Audio (exclusive with output_media)
+  if (toggleAudio.classList.contains("on")) {
+    stopAudioStream();
+  }
+}
+
+// ── Camera toggle ─────────────────────────────────────────────────────
 
 let videoRecorder = null;
 
-btnStartVideo.addEventListener("click", async () => {
-  const source = videoSourceSelect.value;
-  if (!source) {
-    statusBar.textContent = "Select a video source first";
+// Auto-switch source when dropdown changes while camera is ON
+cameraSource.addEventListener("change", async () => {
+  if (toggleCamera.classList.contains("on")) {
+    // Stop current stream, then re-start with new source
+    stopCamera();
+    toggleCamera.click(); // re-trigger the ON logic
+  }
+});
+
+toggleCamera.addEventListener("click", async () => {
+  if (toggleCamera.classList.contains("on")) {
+    deactivateAllOutputs();
+    statusBar.textContent = "Camera feed cleared";
     return;
   }
+
+  const source = cameraSource.value;
+  if (!source) {
+    statusBar.textContent = "Select a camera source first";
+    return;
+  }
+
+  deactivateAllOutputs();
 
   try {
     if (source === "camera") {
@@ -611,43 +691,29 @@ btnStartVideo.addEventListener("click", async () => {
     }
 
     streamVideo.srcObject = videoStream;
-    btnStartVideo.style.display = "none";
-    btnStopVideo.style.display = "";
-    videoSourceSelect.disabled = true;
-
-    // Start MediaRecorder → webm chunks → server → ffmpeg → HLS
+    cameraSource.disabled = true;
     startVideoRecorder();
-    statusBar.textContent = "Video streaming (HLS encoding)";
+    toggleCamera.classList.add("on");
+    indCamera.classList.add("active");
+    showPreview("camera");
+    // Activate output_media on all bots so they show the HLS stream
+    bridge.activateOutputMedia();
+    statusBar.textContent = "Camera streaming (HLS)";
   } catch (err) {
-    statusBar.textContent = `Failed to start video: ${err.message}`;
+    statusBar.textContent = `Camera failed: ${err.message}`;
   }
-});
-
-btnStopVideo.addEventListener("click", () => {
-  stopVideoRecorder();
-  if (videoStream) {
-    videoStream.getTracks().forEach((t) => t.stop());
-    videoStream = null;
-  }
-  streamVideo.srcObject = null;
-  btnStartVideo.style.display = "";
-  btnStopVideo.style.display = "none";
-  videoSourceSelect.disabled = false;
-  bridge.streamStop();
-  statusBar.textContent = "Video streaming stopped";
 });
 
 function startVideoRecorder() {
   if (videoRecorder || !videoStream) return;
 
-  // Use VP8 webm — ffmpeg can decode this for HLS
   const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
     ? "video/webm;codecs=vp8"
     : "video/webm";
 
   videoRecorder = new MediaRecorder(videoStream, {
     mimeType,
-    videoBitsPerSecond: 2000000, // 2 Mbps
+    videoBitsPerSecond: 2000000,
   });
 
   videoRecorder.ondataavailable = async (e) => {
@@ -658,7 +724,6 @@ function startVideoRecorder() {
     if (framesSent % 10 === 0) updateStreamInfo();
   };
 
-  // Send chunks every 200ms (small chunks = low latency)
   videoRecorder.start(200);
   framesSent = 0;
   console.log("[stream] MediaRecorder started:", mimeType);
@@ -698,24 +763,118 @@ function updateStreamInfo() {
     `Mode: <span style="color:${modeColor}">${modeLabel}</span>`;
 }
 
-// ── Real-time Audio Streaming ─────────────────────────────────────────
+// ── Image toggle ──────────────────────────────────────────────────────
 
-btnStartAudio.addEventListener("click", async () => {
+btnPickImage.addEventListener("click", () => {
+  modalTargetBotId = null;
+  modalTitle.textContent = "Choose Image";
+  openModal();
+});
+
+toggleImage.addEventListener("click", async () => {
+  if (toggleImage.classList.contains("on")) {
+    deactivateAllOutputs();
+    statusBar.textContent = "Image feed cleared";
+  } else if (pendingImageB64) {
+    // ON = broadcast the current image (turns off others first)
+    deactivateAllOutputs();
+    await broadcastCurrentImage();
+  } else {
+    // No image yet — open picker
+    modalTargetBotId = null;
+    modalTitle.textContent = "Choose Image";
+    openModal();
+  }
+});
+
+// ── URL toggle + send ─────────────────────────────────────────────────
+
+async function pushUrlToBots() {
+  let url = urlInput.value.trim();
+  if (!url) {
+    statusBar.textContent = "Enter a URL first";
+    urlInput.focus();
+    return false;
+  }
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    url = "https://" + url;
+    urlInput.value = url;
+  }
+
+  deactivateAllOutputs();
+
+  let sent = 0;
+  for (const bot of activeBots) {
+    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    try {
+      const result = await bridge.startOutputMedia(bot.id, url);
+      if (result.error) {
+        statusBar.textContent = `URL failed: ${result.error}`;
+        return false;
+      }
+      sent++;
+    } catch (err) {
+      statusBar.textContent = `URL failed: ${err.message}`;
+      return false;
+    }
+  }
+
+  toggleUrl.classList.add("on");
+  indUrl.classList.add("active");
+  statusBar.textContent = `URL output active on ${sent} bot(s): ${url}`;
+  return true;
+}
+
+toggleUrl.addEventListener("click", async () => {
+  if (toggleUrl.classList.contains("on")) {
+    deactivateAllOutputs();
+    statusBar.textContent = "URL feed cleared";
+    return;
+  }
+  await pushUrlToBots();
+});
+
+// Send button pushes URL (turns on toggle if off)
+btnSendUrl.addEventListener("click", () => pushUrlToBots());
+
+// Enter key in URL input pushes URL
+urlInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") pushUrlToBots();
+});
+
+// ── Video / Screenshare stubs ─────────────────────────────────────────
+
+toggleVideo.addEventListener("click", () => {
+  statusBar.textContent = "Video file playback — coming soon";
+});
+
+toggleScreenshare.addEventListener("click", () => {
+  statusBar.textContent = "Screenshare via webpage — coming soon";
+});
+
+// ── Audio toggle ──────────────────────────────────────────────────────
+
+toggleAudio.addEventListener("click", async () => {
+  if (toggleAudio.classList.contains("on")) {
+    deactivateAllOutputs();
+    statusBar.textContent = "Audio feed cleared";
+    return;
+  }
+
+  deactivateAllOutputs();
+
   try {
     audioStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
       video: false,
     });
 
-    // Record 3-second chunks of audio
     audioRecorder = new MediaRecorder(audioStream, {
       mimeType: "audio/webm;codecs=opus",
     });
 
     audioRecorder.ondataavailable = async (e) => {
       if (e.data.size === 0) return;
-
-      // Convert blob to base64
       const buffer = await e.data.arrayBuffer();
       const b64 = btoa(
         new Uint8Array(buffer).reduce(
@@ -723,16 +882,9 @@ btnStartAudio.addEventListener("click", async () => {
           ""
         )
       );
-
-      // Send to all bots (server transcodes webm → mp3)
-      try {
-        await bridge.broadcastAudioWebm(b64);
-      } catch {
-        // Ignore audio send errors
-      }
+      try { await bridge.broadcastAudioWebm(b64); } catch {}
     };
 
-    // Record in 3-second chunks
     audioRecorder.start();
     audioChunkInterval = setInterval(() => {
       if (audioRecorder && audioRecorder.state === "recording") {
@@ -741,30 +893,37 @@ btnStartAudio.addEventListener("click", async () => {
       }
     }, 3000);
 
-    btnStartAudio.style.display = "none";
-    btnStopAudio.style.display = "";
-    statusBar.textContent = "Mic streaming started (3s chunks)";
+    toggleAudio.classList.add("on");
+    indAudio.classList.add("active");
+    statusBar.textContent = "Audio streaming (3s chunks)";
     updateStreamInfo();
   } catch (err) {
-    statusBar.textContent = `Failed to start mic: ${err.message}`;
+    statusBar.textContent = `Audio failed: ${err.message}`;
   }
 });
 
-btnStopAudio.addEventListener("click", () => {
-  if (audioChunkInterval) {
-    clearInterval(audioChunkInterval);
-    audioChunkInterval = null;
+// ── Startup: recover any existing bots from server ───────────────────
+(async () => {
+  // Retry a few times — server may still be recovering bots on startup
+  for (let attempt = 0; attempt < 5; attempt++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    try {
+      const bots = await bridge.listBots();
+      if (Array.isArray(bots) && bots.length > 0) {
+        const active = bots.filter(
+          (b) => !["done", "fatal", "media_expired"].includes(b.status)
+        );
+        if (active.length > 0) {
+          activeBots = active;
+          renderBots();
+          startPolling();
+          btnRemoveAll.disabled = false;
+          statusBar.textContent = `Recovered ${active.length} active bot(s)`;
+          return;
+        }
+      }
+    } catch {
+      // Server not ready yet — retry
+    }
   }
-  if (audioRecorder) {
-    audioRecorder.stop();
-    audioRecorder = null;
-  }
-  if (audioStream) {
-    audioStream.getTracks().forEach((t) => t.stop());
-    audioStream = null;
-  }
-  btnStartAudio.style.display = "";
-  btnStopAudio.style.display = "none";
-  statusBar.textContent = "Mic streaming stopped";
-  updateStreamInfo();
-});
+})();
