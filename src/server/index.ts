@@ -257,6 +257,31 @@ app.post("/api/bots/activate-video-output", async (_req, res) => {
   res.json({ ok: true, activated });
 });
 
+// Activate music output on all active bots
+app.post("/api/bots/activate-music-output", async (_req, res) => {
+  if (!tunnelHttpUrl) {
+    res.status(503).json({ error: "No tunnel available" });
+    return;
+  }
+  if (!currentMusicFile) {
+    res.status(400).json({ error: "No music uploaded" });
+    return;
+  }
+
+  let activated = 0;
+  for (const [, bot] of bots) {
+    if (["done", "fatal", "leaving"].includes(bot.status)) continue;
+    try {
+      const url = `${tunnelHttpUrl}/output-media/music`;
+      if (await setOutputMedia(bot, url)) {
+        activated++;
+        console.log(`[bot] ${bot.id} music output activated: ${url}`);
+      }
+    } catch {}
+  }
+  res.json({ ok: true, activated });
+});
+
 // Deactivate output_media on all active bots
 app.post("/api/bots/deactivate-output-media", async (_req, res) => {
   let deactivated = 0;
@@ -476,6 +501,57 @@ app.post("/api/upload-video", express.raw({ type: "*/*", limit: "500mb" }), asyn
   }
 });
 
+// ── Music/audio file upload & playback ────────────────────────────────
+
+const MUSIC_DIR = path.join(process.cwd(), "media", "music");
+if (!existsSync(MUSIC_DIR)) mkdirSync(MUSIC_DIR, { recursive: true });
+
+let currentMusicFile: string | null = null;
+
+app.use("/media/music", express.static(MUSIC_DIR, {
+  setHeaders: (res) => {
+    res.set("Cache-Control", "no-cache");
+    res.set("Access-Control-Allow-Origin", "*");
+  },
+}));
+
+app.post("/api/upload-music", express.raw({ type: "*/*", limit: "500mb" }), async (req, res) => {
+  const fileName = (req.headers["x-filename"] as string) || "audio.mp3";
+  if (!req.body || req.body.length === 0) {
+    res.status(400).json({ error: "No file data" });
+    return;
+  }
+
+  const ext = path.extname(fileName) || ".mp3";
+  const destName = `current${ext}`;
+  const destPath = path.join(MUSIC_DIR, destName);
+
+  try {
+    if (currentMusicFile && currentMusicFile !== destName) {
+      await unlink(path.join(MUSIC_DIR, currentMusicFile)).catch(() => {});
+    }
+    await writeFile(destPath, req.body);
+    currentMusicFile = destName;
+    console.log(`[music] Uploaded: ${fileName} (${req.body.length} bytes) → ${destName}`);
+    res.json({ ok: true, filename: destName });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/output-media/music", (_req, res) => {
+  if (!currentMusicFile) {
+    res.status(404).send("No music uploaded");
+    return;
+  }
+  res.type("html").send(`<!DOCTYPE html><html><head>
+<style>*{margin:0;padding:0}body{background:#000;overflow:hidden;width:100vw;height:100vh}</style>
+</head><body>
+<audio id="a" autoplay loop src="/media/music/${currentMusicFile}?t=${Date.now()}"></audio>
+<script>document.getElementById("a").play().catch(()=>{});</script>
+</body></html>`);
+});
+
 app.get("/output-media/video", (_req, res) => {
   if (!currentVideoFile) {
     res.status(404).send("No video uploaded");
@@ -485,7 +561,8 @@ app.get("/output-media/video", (_req, res) => {
 <style>*{margin:0;padding:0}body{background:#000;overflow:hidden;width:100vw;height:100vh}
 video{width:100%;height:100%;object-fit:contain}</style>
 </head><body>
-<video autoplay loop muted playsinline src="/media/video/${currentVideoFile}?t=${Date.now()}"></video>
+<video id="v" autoplay loop playsinline src="/media/video/${currentVideoFile}?t=${Date.now()}"></video>
+<script>document.getElementById("v").play().catch(()=>{});</script>
 </body></html>`);
 });
 

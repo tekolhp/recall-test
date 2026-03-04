@@ -526,6 +526,34 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.handle("upload-music", async (_event, fileName: string, buffer: Buffer) => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const buf = Buffer.isBuffer(buffer) ? buffer : Buffer.from(buffer);
+      const res = await fetch(`${BACKEND_URL}/api/upload-music`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/octet-stream",
+          "X-Filename": fileName,
+        },
+        body: new Uint8Array(buf) as any,
+      });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
+  ipcMain.handle("activate-music-output", async () => {
+    if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/bots/activate-music-output`, { method: "POST" });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
   ipcMain.handle("activate-video-output", async () => {
     if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
     try {

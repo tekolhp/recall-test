@@ -37,8 +37,10 @@ const btnPickVideo = document.getElementById("btn-pick-video");
 const videoFileInput = document.getElementById("video-file-input");
 const toggleVideo = document.getElementById("toggle-video");
 const indVideo = document.getElementById("ind-video");
-const toggleScreenshare = document.getElementById("toggle-screenshare");
-const indScreenshare = document.getElementById("ind-screenshare");
+const btnPickMusic = document.getElementById("btn-pick-music");
+const musicFileInput = document.getElementById("music-file-input");
+const toggleMusic = document.getElementById("toggle-music");
+const indMusic = document.getElementById("ind-music");
 const urlInput = document.getElementById("url-input");
 const btnSendUrl = document.getElementById("btn-send-url");
 const toggleUrl = document.getElementById("toggle-url");
@@ -68,6 +70,9 @@ let pushSocket = null; // Direct WebSocket to server for frame pushing
 // Video file state
 let videoFileUrl = null; // blob URL for local preview
 let videoUploaded = false;
+
+// Music file state
+let musicUploaded = false;
 
 const bridge = window.recallBridge;
 
@@ -633,6 +638,11 @@ function deactivateAllOutputs() {
     streamVideo.srcObject = null;
     showPreview("none");
   }
+  if (toggleMusic.classList.contains("on")) {
+    toggleMusic.classList.remove("on");
+    indMusic.classList.remove("active");
+    showPreview("none");
+  }
   if (toggleUrl.classList.contains("on")) {
     toggleUrl.classList.remove("on");
     indUrl.classList.remove("active");
@@ -927,8 +937,66 @@ toggleVideo.addEventListener("click", async () => {
   await activateVideoOutput();
 });
 
-toggleScreenshare.addEventListener("click", () => {
-  statusBar.textContent = "Screenshare via webpage — coming soon";
+
+// ── Music file upload + toggle ────────────────────────────────────────
+
+btnPickMusic.addEventListener("click", () => musicFileInput.click());
+
+musicFileInput.addEventListener("change", async () => {
+  const file = musicFileInput.files?.[0];
+  if (!file) return;
+  musicFileInput.value = "";
+
+  statusBar.textContent = "Uploading music...";
+  try {
+    const buffer = await file.arrayBuffer();
+    const result = await bridge.uploadMusic(file.name, buffer);
+    if (result.error) {
+      statusBar.textContent = `Music upload failed: ${result.error}`;
+      return;
+    }
+    musicUploaded = true;
+    btnPickMusic.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+    statusBar.textContent = `Music uploaded: ${file.name}`;
+
+    if (toggleMusic.classList.contains("on")) {
+      await activateMusicOutput();
+    }
+  } catch (err) {
+    statusBar.textContent = `Music upload failed: ${err.message}`;
+  }
+});
+
+async function activateMusicOutput() {
+  try {
+    const result = await bridge.activateMusicOutput();
+    if (result.error) {
+      statusBar.textContent = `Music activation failed: ${result.error}`;
+      return;
+    }
+    showPreview("none");
+    toggleMusic.classList.add("on");
+    indMusic.classList.add("active");
+    statusBar.textContent = `Music output active on ${result.activated} bot(s)`;
+  } catch (err) {
+    statusBar.textContent = `Music activation failed: ${err.message}`;
+  }
+}
+
+toggleMusic.addEventListener("click", async () => {
+  if (toggleMusic.classList.contains("on")) {
+    await deactivateAllOutputsAndApi();
+    statusBar.textContent = "Music feed cleared";
+    return;
+  }
+
+  if (!musicUploaded) {
+    musicFileInput.click();
+    return;
+  }
+
+  deactivateAllOutputs();
+  await activateMusicOutput();
 });
 
 // ── Audio toggle ──────────────────────────────────────────────────────

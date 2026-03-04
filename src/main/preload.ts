@@ -74,6 +74,10 @@ contextBridge.exposeInMainWorld("recallBridge", {
     ipcRenderer.invoke("upload-video", fileName, Buffer.from(buffer)),
   activateVideoOutput: () =>
     ipcRenderer.invoke("activate-video-output"),
+  uploadMusic: (fileName: string, buffer: ArrayBuffer) =>
+    ipcRenderer.invoke("upload-music", fileName, Buffer.from(buffer)),
+  activateMusicOutput: () =>
+    ipcRenderer.invoke("activate-music-output"),
   pushOutputMediaFrame: (b64Data: string) =>
     ipcRenderer.invoke("push-output-media-frame", b64Data),
 });

@@ -451,17 +451,17 @@
         <div class="feature-indicator" id="ind-video"></div>
       </div>
       <div class="feature-row">
+        <span class="feature-label">Music</span>
+        <button class="feature-btn" id="btn-pick-music">Choose File</button>
+        <div class="feature-toggle" id="toggle-music"></div>
+        <div class="feature-indicator" id="ind-music"></div>
+      </div>
+      <div class="feature-row">
         <span class="feature-label">URL</span>
         <input type="text" class="feature-url-input" id="url-input" placeholder="https://example.com/page" />
         <button class="feature-btn" id="btn-send-url" style="flex:none;width:auto;padding:5px 10px;">Send</button>
         <div class="feature-toggle" id="toggle-url"></div>
         <div class="feature-indicator" id="ind-url"></div>
-      </div>
-      <div class="feature-row">
-        <span class="feature-label">Screenshare</span>
-        <button class="feature-btn" id="btn-screenshare" disabled>Configure</button>
-        <div class="feature-toggle" id="toggle-screenshare"></div>
-        <div class="feature-indicator" id="ind-screenshare"></div>
       </div>
       <div class="feature-row">
         <span class="feature-label">Audio</span>
@@ -492,6 +492,7 @@
       </div>
       <input type="file" id="file-input" accept="image/jpeg,image/png" style="display:none" />
       <input type="file" id="video-file-input" accept="video/*" style="display:none" />
+      <input type="file" id="music-file-input" accept="audio/*" style="display:none" />
       <div class="modal-actions">
         <button class="btn-cancel" id="modal-cancel">Cancel</button>
         <button class="btn-send-modal" id="modal-send" disabled>Send</button>
