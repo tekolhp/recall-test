@@ -247,30 +247,6 @@ function connectTranscriptSocket() {
 connectTranscriptSocket();
 checkNgrokStatus();
 
-// Show webhook URL in status bar for Recall dashboard configuration
-(async () => {
-  // Wait a moment for smee to initialize
-  await new Promise((r) => setTimeout(r, 3000));
-  try {
-    const info = await bridge.getTunnelInfo();
-    const url = info?.smeeUrl || info?.webhookUrl;
-    if (url) {
-      const isSmee = url.includes("smee.io");
-      const label = isSmee ? "Webhook (permanent)" : "Webhook";
-      const hint = isSmee
-        ? "(click to copy — set once in Recall dashboard → Webhooks)"
-        : "(click to copy — set in Recall dashboard → Webhooks, changes on restart)";
-      statusBar.innerHTML = `${label}: <span style="color:#4f8eff;cursor:pointer;text-decoration:underline" id="webhook-url">${url}</span> <span style="color:#555">${hint}</span>`;
-      document.getElementById("webhook-url")?.addEventListener("click", () => {
-        navigator.clipboard.writeText(url);
-        statusBar.textContent = "Webhook URL copied to clipboard!";
-        setTimeout(() => {
-          statusBar.innerHTML = `${label}: <span style="color:#4f8eff">${url}</span> <span style="color:#00cc6a">✓ Copied</span>`;
-        }, 1500);
-      });
-    }
-  } catch {}
-})();
 
 // ── Listen for toggle state changes ───────────────────────────────────
 if (bridge.onToggleState) {
@@ -633,32 +609,8 @@ function renderBots() {
 
   emptyState.style.display = "none";
 
-  const hasBreakoutRooms = activeBots.some((b) => b.breakoutRoom);
-
-  if (hasBreakoutRooms) {
-    renderBotsGrouped();
-  } else {
-    // Flat list — remove any leftover room sections
-    botGrid.querySelectorAll(".room-section").forEach((s) => s.remove());
-
-    const existingTiles = new Map();
-    botGrid.querySelectorAll(":scope > .bot-tile").forEach((tile) => {
-      existingTiles.set(tile.dataset.botId, tile);
-    });
-    botGrid.querySelectorAll(".empty-state").forEach((el) => el.remove());
-
-    for (const bot of activeBots) {
-      let tile = existingTiles.get(bot.id);
-      if (!tile) {
-        tile = createBotTile(bot);
-        botGrid.appendChild(tile);
-      } else {
-        updateBotTile(tile, bot);
-        existingTiles.delete(bot.id);
-      }
-    }
-    for (const [, tile] of existingTiles) tile.remove();
-  }
+  // Always use grouped view — bots without a breakout room go into "Meeting"
+  renderBotsGrouped();
 }
 
 function renderBotsGrouped() {
@@ -692,13 +644,21 @@ function renderBotsGrouped() {
     const color = room === "Main Room" ? "#4f8eff" : ROOM_COLORS[colorIdx++ % ROOM_COLORS.length];
 
     // Collect unique participants across all bots in this room
+    // Collect participants from activeParticipants (realtime) and meetingParticipants (REST fallback)
     const participantMap = new Map();
     for (const bot of bots) {
+      for (const p of (bot.activeParticipants || [])) {
+        const id = typeof p === "object" ? p.id : p;
+        const name = typeof p === "object" ? p.name : p;
+        if (!participantMap.has(String(id))) participantMap.set(String(id), name);
+      }
       for (const p of (bot.meetingParticipants || [])) {
-        if (!participantMap.has(p.id)) participantMap.set(p.id, p.name);
+        if (!participantMap.has(String(p.id))) participantMap.set(String(p.id), p.name);
       }
     }
-    const participants = [...participantMap.values()];
+    // Filter out bots from participant count
+    const botNames = new Set(activeBots.map((b) => b.name));
+    const participants = [...participantMap.values()].filter((name) => !botNames.has(name));
 
     let section = existingSections.get(room);
     if (!section) {
@@ -709,27 +669,18 @@ function renderBotsGrouped() {
         <div class="room-header">
           <span class="room-dot" style="background:${color}"></span>
           <span class="room-name">${room}</span>
-          <span class="room-count">${bots.length} bot(s)</span>
+          <span class="room-count">${bots.length} bot(s) · ${participants.length} participant(s)</span>
         </div>
-        <div class="room-participants"></div>
         <div class="room-bots"></div>
       `;
       botGrid.appendChild(section);
     } else {
-      section.querySelector(".room-count").textContent = `${bots.length} bot(s)`;
+      section.querySelector(".room-count").textContent = `${bots.length} bot(s) · ${participants.length} participant(s)`;
       section.querySelector(".room-dot").style.background = color;
       existingSections.delete(room);
     }
 
-    // Update participant list
-    const pEl = section.querySelector(".room-participants");
-    if (participants.length > 0) {
-      pEl.innerHTML = participants.map((name) =>
-        `<span class="room-participant">${name}</span>`
-      ).join("");
-    } else {
-      pEl.innerHTML = "";
-    }
+
 
     const container = section.querySelector(".room-bots");
     const existingTiles = new Map();
@@ -834,9 +785,7 @@ function destroyHlsPlayer(botId) {
 
 function updateBotTile(tile, bot) {
   const nameEl = tile.querySelector(".bot-tile-name");
-  nameEl.textContent = bot.breakoutRoom
-    ? `${bot.name} — ${bot.breakoutRoom}`
-    : bot.name;
+  nameEl.textContent = bot.name;
 
   const statusText = tile.querySelector(".bot-tile-status-text");
   statusText.textContent = formatStatus(bot.status);

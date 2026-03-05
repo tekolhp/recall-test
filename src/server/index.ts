@@ -39,8 +39,10 @@ interface BotRecord {
   meetingUrl: string;
   createdAt: string;
   meetingParticipants: { id: number; name: string }[];
-  /** Participants currently visible to this bot (tracked via realtime participant_events) */
-  activeParticipants: Set<string>;
+  /** Participants currently visible to this bot (id → name, tracked via realtime participant_events) */
+  activeParticipants: Map<string, string>;
+  /** Whether this bot has received at least one participant event */
+  hasReceivedParticipantEvents: boolean;
 }
 
 const bots = new Map<string, BotRecord>();
@@ -55,7 +57,7 @@ const BOT_STATE_FILE = path.join(__dirname, "..", "bot-state.json");
 function saveBotState() {
   const serializable = Array.from(bots.values()).map((b) => ({
     ...b,
-    activeParticipants: Array.from(b.activeParticipants || []),
+    activeParticipants: Object.fromEntries(b.activeParticipants || new Map()),
   }));
   const state = { botCounter, bots: serializable };
   writeFile(BOT_STATE_FILE, JSON.stringify(state, null, 2)).catch(() => {});
@@ -69,7 +71,15 @@ async function loadBotState(): Promise<boolean> {
     if (Array.isArray(state.bots)) {
       for (const b of state.bots) {
         if (!["done", "fatal", "media_expired", "call_ended"].includes(b.status)) {
-          b.activeParticipants = new Set(b.activeParticipants || []);
+          // Handle both old format (array of IDs) and new format (object of id→name)
+          if (Array.isArray(b.activeParticipants)) {
+            b.activeParticipants = new Map(b.activeParticipants.map((p: any) =>
+              typeof p === "object" ? [String(p.id), p.name] : [String(p), "Unknown"]
+            ));
+          } else {
+            b.activeParticipants = new Map(Object.entries(b.activeParticipants || {}));
+          }
+          b.hasReceivedParticipantEvents = b.hasReceivedParticipantEvents || false;
           bots.set(b.id, b);
           if (b.recallBotId) recallToLocal.set(b.recallBotId, b.id);
         }
@@ -213,7 +223,8 @@ async function recoverBots() {
             id: p.id,
             name: p.name || "Unknown",
           })),
-          activeParticipants: new Set(),
+          activeParticipants: new Map(),
+          hasReceivedParticipantEvents: false,
         });
         recallToLocal.set(bot.id, localId);
         recovered++;
@@ -1111,8 +1122,10 @@ app.post("/webhooks/participant/:localId", (req, res) => {
   const pName = body.data?.participant?.name || body.data?.data?.participant?.name || body.participant?.name || "Unknown";
   const pId = String(body.data?.participant?.id || body.data?.data?.participant?.id || body.participant?.id || pName);
 
+  bot.hasReceivedParticipantEvents = true;
+
   if (event === "participant_events.join") {
-    bot.activeParticipants.add(pId);
+    bot.activeParticipants.set(pId, pName);
     console.log(`[participant] ${bot.name}: +${pName} (${bot.activeParticipants.size} total)`);
   } else if (event === "participant_events.leave") {
     bot.activeParticipants.delete(pId);
@@ -1125,62 +1138,78 @@ app.post("/webhooks/participant/:localId", (req, res) => {
   res.json({ ok: true });
 });
 
-/** Compare participant sets across bots — bots with different sets are in different rooms */
+/**
+ * Detect breakout rooms by checking bot-to-bot visibility.
+ * Bots see each other as participants — if bot A can see bot B, they're in the same room.
+ * If they can't see each other, they're in different rooms.
+ */
 function detectBreakoutRooms() {
   const activeBots = Array.from(bots.values()).filter(
     (b) => !["done", "fatal", "leaving", "joining_call"].includes(b.status)
   );
   if (activeBots.length < 2) return;
 
-  const botsWithP = activeBots.filter((b) => b.activeParticipants?.size > 0);
-  console.log(`[rooms] check: ${activeBots.length} active, ${botsWithP.length} with participants, sizes: ${activeBots.map(b => b.activeParticipants?.size ?? 0).join(",")}`);
+  // Don't run until at least one bot has received participant events
+  if (!activeBots.some((b) => b.hasReceivedParticipantEvents)) return;
 
-  if (botsWithP.length >= 2) {
-    // Multiple bots have participants — check for overlap
-    let allOverlap = true;
-    for (let i = 0; i < botsWithP.length && allOverlap; i++) {
-      for (let j = i + 1; j < botsWithP.length && allOverlap; j++) {
-        const overlap = [...botsWithP[i].activeParticipants]
-          .filter((p) => botsWithP[j].activeParticipants.has(p)).length;
-        if (overlap === 0) allOverlap = false;
-      }
-    }
+  // Build a set of all active bot names for matching
+  const botNameToLocal = new Map<string, string>();
+  for (const bot of activeBots) botNameToLocal.set(bot.name, bot.id);
 
-    if (allOverlap) {
-      // All bots share participants → same room — clear breakout assignments
-      for (const bot of activeBots) {
-        if (bot.breakoutRoom) {
-          bot.breakoutRoom = null;
-          console.log(`[rooms] ${bot.name} returned to main room`);
+  // Group bots by visibility: if bot A sees bot B as a participant, they're in the same room
+  const assigned = new Set<string>();
+  const rooms: BotRecord[][] = [];
+
+  for (const bot of activeBots) {
+    if (assigned.has(bot.id)) continue;
+
+    const room = [bot];
+    assigned.add(bot.id);
+
+    // Find which other bots this bot can see as participants
+    const visibleBotNames = new Set(
+      [...bot.activeParticipants.values()].filter((name) => botNameToLocal.has(name))
+    );
+
+    for (const other of activeBots) {
+      if (assigned.has(other.id)) continue;
+      // Check bidirectional: either bot sees the other
+      const otherSeesThis = [...other.activeParticipants.values()].some(
+        (name) => name === bot.name
+      );
+      if (visibleBotNames.has(other.name) || otherSeesThis) {
+        room.push(other);
+        assigned.add(other.id);
+        // Also add this bot's visible bots to find transitive roommates
+        for (const [, name] of other.activeParticipants) {
+          if (botNameToLocal.has(name)) visibleBotNames.add(name);
         }
       }
-      return;
     }
-  } else if (botsWithP.length <= 1 && activeBots.some((b) => b.breakoutRoom)) {
-    // Not enough data to change — keep existing assignments
-    return;
-  } else if (botsWithP.length <= 1) {
-    // Only 1 or 0 bots have participant data and no existing rooms — check if it's a split
-    // If one bot has participants and others don't, they're likely in different rooms
-    if (botsWithP.length === 1 && activeBots.length >= 2) {
-      // One bot sees people, others don't — different rooms
-    } else {
-      return; // No data to work with
-    }
+
+    rooms.push(room);
   }
 
-  // Bots are in DIFFERENT rooms — assign room labels
-  let roomIdx = 0;
-  for (const bot of activeBots) {
-    roomIdx++;
-    const roomName = `Room ${roomIdx}`;
-    if (bot.breakoutRoom !== roomName) {
-      bot.breakoutRoom = roomName;
-      console.log(`[rooms] ${bot.name} → ${roomName} (${bot.activeParticipants.size} participants)`);
+  if (rooms.length <= 1) {
+    // All bots in same room — clear breakout assignments
+    for (const bot of activeBots) {
+      if (bot.breakoutRoom) {
+        bot.breakoutRoom = null;
+        console.log(`[rooms] ${bot.name} returned to main room`);
+      }
     }
-  }
-  if (!activeBots.every((b) => b.breakoutRoom)) {
-    console.log(`[rooms] ${roomIdx} rooms detected`);
+  } else {
+    // Multiple rooms detected
+    console.log(`[rooms] Detected ${rooms.length} rooms from bot visibility`);
+    for (let i = 0; i < rooms.length; i++) {
+      const roomName = `Room ${i + 1}`;
+      for (const bot of rooms[i]) {
+        if (bot.breakoutRoom !== roomName) {
+          bot.breakoutRoom = roomName;
+          console.log(`[rooms] ${bot.name} → ${roomName}`);
+        }
+      }
+    }
   }
 }
 
@@ -1440,7 +1469,8 @@ app.post("/api/bots/deploy", async (req, res) => {
         meetingUrl: meeting_url,
         createdAt: new Date().toISOString(),
         meetingParticipants: [],
-        activeParticipants: new Set(),
+        activeParticipants: new Map(),
+        hasReceivedParticipantEvents: false,
       };
 
       bots.set(localId, record);
@@ -1455,7 +1485,10 @@ app.post("/api/bots/deploy", async (req, res) => {
 
   saveBotState();
   res.json({
-    created: created.map((b) => ({ ...b, activeParticipants: Array.from(b.activeParticipants || []) })),
+    created: created.map((b) => ({
+      ...b,
+      activeParticipants: [...(b.activeParticipants || new Map())].map(([id, name]) => ({ id, name })),
+    })),
     errors,
     mode: tunnelHttpUrl ? "webpage" : "api",
   });
@@ -1502,7 +1535,7 @@ app.get("/api/bots", async (_req, res) => {
   saveBotState();
   res.json(Array.from(bots.values()).map((b) => ({
     ...b,
-    activeParticipants: Array.from(b.activeParticipants || []),
+    activeParticipants: [...(b.activeParticipants || new Map())].map(([id, name]) => ({ id, name })),
   })));
 });
 
