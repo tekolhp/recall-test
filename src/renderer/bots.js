@@ -249,19 +249,24 @@ checkNgrokStatus();
 
 // Show webhook URL in status bar for Recall dashboard configuration
 (async () => {
+  // Wait a moment for smee to initialize
+  await new Promise((r) => setTimeout(r, 3000));
   try {
     const info = await bridge.getTunnelInfo();
-    if (info?.webhookUrl) {
-      statusBar.innerHTML = `Webhook: <span style="color:#4f8eff;cursor:pointer;text-decoration:underline" id="webhook-url">${info.webhookUrl}</span> <span style="color:#555">(click to copy — set this in Recall dashboard → Webhooks)</span>`;
+    const url = info?.smeeUrl || info?.webhookUrl;
+    if (url) {
+      const isSmee = url.includes("smee.io");
+      const label = isSmee ? "Webhook (permanent)" : "Webhook";
+      const hint = isSmee
+        ? "(click to copy — set once in Recall dashboard → Webhooks)"
+        : "(click to copy — set in Recall dashboard → Webhooks, changes on restart)";
+      statusBar.innerHTML = `${label}: <span style="color:#4f8eff;cursor:pointer;text-decoration:underline" id="webhook-url">${url}</span> <span style="color:#555">${hint}</span>`;
       document.getElementById("webhook-url")?.addEventListener("click", () => {
-        navigator.clipboard.writeText(info.webhookUrl);
+        navigator.clipboard.writeText(url);
         statusBar.textContent = "Webhook URL copied to clipboard!";
-        setTimeout(async () => {
-          const fresh = await bridge.getTunnelInfo();
-          if (fresh?.webhookUrl) {
-            statusBar.innerHTML = `Webhook: <span style="color:#4f8eff">${fresh.webhookUrl}</span>`;
-          }
-        }, 2000);
+        setTimeout(() => {
+          statusBar.innerHTML = `${label}: <span style="color:#4f8eff">${url}</span> <span style="color:#00cc6a">✓ Copied</span>`;
+        }, 1500);
       });
     }
   } catch {}

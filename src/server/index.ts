@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { WebSocketServer, WebSocket } from "ws";
 import NodeMediaServer from "node-media-server";
+import { EventSource } from "eventsource";
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
@@ -38,19 +39,25 @@ interface BotRecord {
   meetingUrl: string;
   createdAt: string;
   meetingParticipants: { id: number; name: string }[];
+  /** Participants currently visible to this bot (tracked via realtime participant_events) */
+  activeParticipants: Set<string>;
 }
 
 const bots = new Map<string, BotRecord>();
 let botCounter = 0; // Global counter for unique bot IDs across deploys
 
+// Map recallBotId → localId for fast lookup from webhooks
+const recallToLocal = new Map<string, string>();
+
 // ── Bot state persistence ────────────────────────────────────────────
 const BOT_STATE_FILE = path.join(__dirname, "..", "bot-state.json");
 
 function saveBotState() {
-  const state = {
-    botCounter,
-    bots: Array.from(bots.values()),
-  };
+  const serializable = Array.from(bots.values()).map((b) => ({
+    ...b,
+    activeParticipants: Array.from(b.activeParticipants || []),
+  }));
+  const state = { botCounter, bots: serializable };
   writeFile(BOT_STATE_FILE, JSON.stringify(state, null, 2)).catch(() => {});
 }
 
@@ -62,7 +69,9 @@ async function loadBotState(): Promise<boolean> {
     if (Array.isArray(state.bots)) {
       for (const b of state.bots) {
         if (!["done", "fatal", "media_expired", "call_ended"].includes(b.status)) {
+          b.activeParticipants = new Set(b.activeParticipants || []);
           bots.set(b.id, b);
+          if (b.recallBotId) recallToLocal.set(b.recallBotId, b.id);
         }
       }
     }
@@ -79,6 +88,74 @@ async function loadBotState(): Promise<boolean> {
 let appSettings = {
   transcriptionProvider: "recallai" as "recallai" | "deepgram",
 };
+
+// ── Smee.io webhook relay (stable URL for Recall dashboard webhooks) ──
+const SMEE_URL_FILE = path.join(__dirname, "..", "smee-url.txt");
+let smeeUrl: string | null = null;
+let smeeSource: EventSource | null = null;
+
+async function getOrCreateSmeeUrl(): Promise<string> {
+  // Check saved URL
+  try {
+    const saved = (await readFile(SMEE_URL_FILE, "utf-8")).trim();
+    if (saved.startsWith("https://smee.io/")) return saved;
+  } catch {}
+
+  // Create new channel
+  const res = await fetch("https://smee.io/new", { redirect: "manual" });
+  const location = res.headers.get("location");
+  if (location && location.startsWith("https://smee.io/")) {
+    await writeFile(SMEE_URL_FILE, location);
+    return location;
+  }
+  throw new Error("Failed to create smee.io channel");
+}
+
+function connectSmeeRelay(url: string) {
+  if (smeeSource) { smeeSource.close(); smeeSource = null; }
+
+  console.log(`[smee] Connecting to ${url}`);
+  const es = new EventSource(url);
+  smeeSource = es;
+
+  es.onmessage = (evt) => {
+    try {
+      const payload = JSON.parse(evt.data);
+      const body = payload.body || payload;
+      if (!body.event && !body.data) return;
+
+      // Check if this is a participant event (routed via query param)
+      let localId = "";
+      if (typeof payload.query === "object" && payload.query?.localId) {
+        localId = payload.query.localId;
+      } else if (typeof payload.query === "string") {
+        const qMatch = payload.query.match(/localId=([^&]+)/);
+        if (qMatch) localId = qMatch[1];
+      }
+
+      if (localId && body.event?.startsWith("participant_events.")) {
+        console.log(`[smee] Forwarding participant event: ${body.event} → ${localId}`);
+        fetch(`http://localhost:${PORT}/webhooks/participant/${localId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).catch((err: any) => console.error("[smee] Forward error:", err.message));
+      } else if (body.event) {
+        console.log(`[smee] Forwarding: ${body.event}`);
+        fetch(`http://localhost:${PORT}/webhooks/recall`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        }).catch((err: any) => console.error("[smee] Forward error:", err.message));
+      }
+    } catch {}
+  };
+
+  es.onopen = () => console.log("[smee] Connected");
+  es.onerror = () => {
+    console.log("[smee] Connection error, will auto-reconnect...");
+  };
+}
 
 // Recover active bots from Recall API on startup
 async function recoverBots() {
@@ -136,7 +213,9 @@ async function recoverBots() {
             id: p.id,
             name: p.name || "Unknown",
           })),
+          activeParticipants: new Set(),
         });
+        recallToLocal.set(bot.id, localId);
         recovered++;
         console.log(`[bot] Recovered: ${bot.bot_name} (${bot.id}) status=${latestStatus}`);
       }
@@ -1021,6 +1100,90 @@ app.post("/api/create-upload", async (_req, res) => {
   }
 });
 
+// ── Per-bot participant event webhook (for breakout room detection) ──
+app.post("/webhooks/participant/:localId", (req, res) => {
+  const { localId } = req.params;
+  const bot = bots.get(localId);
+  if (!bot) { res.json({ ok: true }); return; }
+
+  const body = req.body;
+  const event = body.event || body.type;
+  const pName = body.data?.participant?.name || body.data?.data?.participant?.name || body.participant?.name || "Unknown";
+  const pId = String(body.data?.participant?.id || body.data?.data?.participant?.id || body.participant?.id || pName);
+
+  if (event === "participant_events.join") {
+    bot.activeParticipants.add(pId);
+    console.log(`[participant] ${bot.name}: +${pName} (${bot.activeParticipants.size} total)`);
+  } else if (event === "participant_events.leave") {
+    bot.activeParticipants.delete(pId);
+    console.log(`[participant] ${bot.name}: -${pName} (${bot.activeParticipants.size} total)`);
+  }
+
+  // Detect breakout rooms by comparing participant sets across bots
+  detectBreakoutRooms();
+  saveBotState();
+  res.json({ ok: true });
+});
+
+/** Compare participant sets across bots — bots with different sets are in different rooms */
+function detectBreakoutRooms() {
+  const activeBots = Array.from(bots.values()).filter(
+    (b) => !["done", "fatal", "leaving", "joining_call"].includes(b.status)
+  );
+  if (activeBots.length < 2) return;
+
+  const botsWithP = activeBots.filter((b) => b.activeParticipants?.size > 0);
+  console.log(`[rooms] check: ${activeBots.length} active, ${botsWithP.length} with participants, sizes: ${activeBots.map(b => b.activeParticipants?.size ?? 0).join(",")}`);
+
+  if (botsWithP.length >= 2) {
+    // Multiple bots have participants — check for overlap
+    let allOverlap = true;
+    for (let i = 0; i < botsWithP.length && allOverlap; i++) {
+      for (let j = i + 1; j < botsWithP.length && allOverlap; j++) {
+        const overlap = [...botsWithP[i].activeParticipants]
+          .filter((p) => botsWithP[j].activeParticipants.has(p)).length;
+        if (overlap === 0) allOverlap = false;
+      }
+    }
+
+    if (allOverlap) {
+      // All bots share participants → same room — clear breakout assignments
+      for (const bot of activeBots) {
+        if (bot.breakoutRoom) {
+          bot.breakoutRoom = null;
+          console.log(`[rooms] ${bot.name} returned to main room`);
+        }
+      }
+      return;
+    }
+  } else if (botsWithP.length <= 1 && activeBots.some((b) => b.breakoutRoom)) {
+    // Not enough data to change — keep existing assignments
+    return;
+  } else if (botsWithP.length <= 1) {
+    // Only 1 or 0 bots have participant data and no existing rooms — check if it's a split
+    // If one bot has participants and others don't, they're likely in different rooms
+    if (botsWithP.length === 1 && activeBots.length >= 2) {
+      // One bot sees people, others don't — different rooms
+    } else {
+      return; // No data to work with
+    }
+  }
+
+  // Bots are in DIFFERENT rooms — assign room labels
+  let roomIdx = 0;
+  for (const bot of activeBots) {
+    roomIdx++;
+    const roomName = `Room ${roomIdx}`;
+    if (bot.breakoutRoom !== roomName) {
+      bot.breakoutRoom = roomName;
+      console.log(`[rooms] ${bot.name} → ${roomName} (${bot.activeParticipants.size} participants)`);
+    }
+  }
+  if (!activeBots.every((b) => b.breakoutRoom)) {
+    console.log(`[rooms] ${roomIdx} rooms detected`);
+  }
+}
+
 app.post("/webhooks/recall", async (req, res) => {
   const { event, data } = req.body;
   console.log(`[webhook] Received: ${event}`);
@@ -1113,7 +1276,8 @@ app.post("/webhooks/recall", async (req, res) => {
 app.get("/api/tunnel-info", (_req, res) => {
   res.json({
     tunnelUrl: tunnelHttpUrl,
-    webhookUrl: tunnelHttpUrl ? `${tunnelHttpUrl}/webhooks/recall` : null,
+    webhookUrl: smeeUrl || (tunnelHttpUrl ? `${tunnelHttpUrl}/webhooks/recall` : null),
+    smeeUrl,
   });
 });
 
@@ -1183,8 +1347,8 @@ app.post("/api/bots/deploy", async (req, res) => {
         },
         realtime_endpoints: [],
       },
-      zoom: {
-        breakout_room_handling: "auto_accept_all_invites",
+      breakout_room: {
+        mode: "auto_accept_all_invites",
       },
       automatic_leave: {
         everyone_left_timeout: { timeout: 600, activate_after: 1 },
@@ -1201,8 +1365,17 @@ app.post("/api/bots/deploy", async (req, res) => {
         events: ["transcript.data", "transcript.partial_data"],
       });
 
-      // Note: breakout room events are only delivered via Svix dashboard webhooks,
-      // not via per-bot realtime_endpoints. Set the webhook URL in the Recall dashboard.
+      // Participant events for automatic breakout room detection
+      // Use smee URL (stable) if available, else cloudflared (changes on restart)
+      const participantWebhookBase = smeeUrl || `${tunnelHttpUrl}/webhooks/participant/${localId}`;
+      const participantUrl = smeeUrl
+        ? `${smeeUrl}?localId=${localId}&type=participant`
+        : participantWebhookBase;
+      botPayload.recording_config.realtime_endpoints.push({
+        type: "webhook",
+        url: participantUrl,
+        events: ["participant_events.join", "participant_events.leave"],
+      });
     }
 
     // RTMP streaming: receive live 720p/30fps video from the meeting
@@ -1267,9 +1440,11 @@ app.post("/api/bots/deploy", async (req, res) => {
         meetingUrl: meeting_url,
         createdAt: new Date().toISOString(),
         meetingParticipants: [],
+        activeParticipants: new Set(),
       };
 
       bots.set(localId, record);
+      recallToLocal.set(data.id, localId);
       created.push(record);
       console.log(`[bot] Created ${localId} → Recall bot ${data.id}`);
     } catch (err: any) {
@@ -1279,7 +1454,11 @@ app.post("/api/bots/deploy", async (req, res) => {
   }
 
   saveBotState();
-  res.json({ created, errors, mode: tunnelHttpUrl ? "webpage" : "api" });
+  res.json({
+    created: created.map((b) => ({ ...b, activeParticipants: Array.from(b.activeParticipants || []) })),
+    errors,
+    mode: tunnelHttpUrl ? "webpage" : "api",
+  });
 });
 
 app.get("/api/bots", async (_req, res) => {
@@ -1318,8 +1497,13 @@ app.get("/api/bots", async (_req, res) => {
     }
   }
 
+  // Re-detect rooms from participant data on each poll
+  detectBreakoutRooms();
   saveBotState();
-  res.json(Array.from(bots.values()));
+  res.json(Array.from(bots.values()).map((b) => ({
+    ...b,
+    activeParticipants: Array.from(b.activeParticipants || []),
+  })));
 });
 
 app.get("/api/bots/:id", async (req, res) => {
@@ -1984,6 +2168,17 @@ server.listen(PORT, async () => {
       console.log(`[server] RTMP via ngrok: ${ngrokTcpUrl.replace("tcp://", "rtmp://")}/live/{bot-id}`);
     }
   });
+
+  // Start smee.io webhook relay (stable URL for breakout room events)
+  getOrCreateSmeeUrl()
+    .then((url) => {
+      smeeUrl = url;
+      console.log(`[smee] ⚡ Webhook URL (paste in Recall dashboard): ${url}`);
+      connectSmeeRelay(url);
+    })
+    .catch((err) => {
+      console.error("[smee] Failed to set up webhook relay:", err.message);
+    });
 });
 
 // ── Graceful shutdown: remove all bots on SIGTERM/SIGINT ─────────────
