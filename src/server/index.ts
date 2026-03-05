@@ -37,10 +37,42 @@ interface BotRecord {
   breakoutRoom: string | null;
   meetingUrl: string;
   createdAt: string;
+  meetingParticipants: { id: number; name: string }[];
 }
 
 const bots = new Map<string, BotRecord>();
 let botCounter = 0; // Global counter for unique bot IDs across deploys
+
+// ── Bot state persistence ────────────────────────────────────────────
+const BOT_STATE_FILE = path.join(__dirname, "..", "bot-state.json");
+
+function saveBotState() {
+  const state = {
+    botCounter,
+    bots: Array.from(bots.values()),
+  };
+  writeFile(BOT_STATE_FILE, JSON.stringify(state, null, 2)).catch(() => {});
+}
+
+async function loadBotState(): Promise<boolean> {
+  try {
+    const raw = await readFile(BOT_STATE_FILE, "utf-8");
+    const state = JSON.parse(raw);
+    if (state.botCounter) botCounter = state.botCounter;
+    if (Array.isArray(state.bots)) {
+      for (const b of state.bots) {
+        if (!["done", "fatal", "media_expired", "call_ended"].includes(b.status)) {
+          bots.set(b.id, b);
+        }
+      }
+    }
+    if (bots.size > 0) {
+      console.log(`[bot] Restored ${bots.size} bot(s) from saved state`);
+      return true;
+    }
+  } catch {}
+  return false;
+}
 
 // ── App settings (synced from main process) ──────────────────────────
 
@@ -97,9 +129,13 @@ async function recoverBots() {
           recallBotId: bot.id,
           name: bot.bot_name || "Recovered Bot",
           status: normalizedStatus,
-          breakoutRoom: null,
+          breakoutRoom: normalizedStatus === "in_breakout_room" ? "Breakout Room" : null,
           meetingUrl: bot.meeting_url || "",
           createdAt: bot.created_at || new Date().toISOString(),
+          meetingParticipants: (bot.meeting_participants || []).map((p: any) => ({
+            id: p.id,
+            name: p.name || "Unknown",
+          })),
         });
         recovered++;
         console.log(`[bot] Recovered: ${bot.bot_name} (${bot.id}) status=${latestStatus}`);
@@ -500,11 +536,12 @@ wssRecallTranscript.on("connection", (ws, req) => {
       const words = inner.words || outer.words || [];
       const text = words.map((w: any) => w.text).join(" ") || inner.text || outer.text || "";
       const isFinal = eventType === "transcript.data";
+      const speaker = inner.participant?.name || outer.participant?.name || "";
 
       if (text.trim()) {
         pushTranscriptToClients({
           botId: localBotId || recallBotId,
-          speaker: "",
+          speaker,
           text,
           is_final: isFinal,
         });
@@ -540,11 +577,12 @@ app.post("/webhook/transcription", express.json(), (req, res) => {
   const words = inner.words || outer.words || [];
   const text = words.map((w: any) => w.text).join(" ") || inner.text || outer.text || "";
   const isFinal = eventType === "transcript.data";
+  const speaker = inner.participant?.name || outer.participant?.name || "";
 
   if (text.trim()) {
     pushTranscriptToClients({
       botId: localBotId || recallBotId,
-      speaker: "",
+      speaker,
       text,
       is_final: isFinal,
     });
@@ -1025,8 +1063,11 @@ app.post("/webhooks/recall", async (req, res) => {
     "bot.recording_permission_denied",
   ];
 
+  // Recall webhook payload: { event, data: { bot: { id }, data: { ... } } }
+  const recallBotId = data?.bot?.id || data?.bot_id || data?.id;
+  console.log(`[webhook] Parsed bot ID: ${recallBotId} from payload: ${JSON.stringify(data).slice(0, 400)}`);
+
   if (botEvents.includes(event)) {
-    const recallBotId = data?.bot_id || data?.id;
     const status = event.replace("bot.", "");
     console.log(`[webhook] Bot ${recallBotId}: ${status}`);
 
@@ -1039,8 +1080,7 @@ app.post("/webhooks/recall", async (req, res) => {
   }
 
   if (event === "bot.breakout_room_entered") {
-    const recallBotId = data?.bot_id || data?.id;
-    const roomName = data?.breakout_room?.name || "Unknown Room";
+    const roomName = data?.data?.breakout_room?.name || data?.breakout_room?.name || "Unknown Room";
     console.log(
       `[webhook] Bot ${recallBotId} entered breakout room: ${roomName}`
     );
@@ -1054,7 +1094,8 @@ app.post("/webhooks/recall", async (req, res) => {
   }
 
   if (event === "bot.breakout_room_left") {
-    const recallBotId = data?.bot_id || data?.id;
+    const roomName = data?.data?.breakout_room?.name || data?.breakout_room?.name || "";
+    console.log(`[webhook] Bot ${recallBotId} left breakout room: ${roomName}`);
     for (const bot of bots.values()) {
       if (bot.recallBotId === recallBotId) {
         bot.breakoutRoom = null;
@@ -1064,7 +1105,16 @@ app.post("/webhooks/recall", async (req, res) => {
     }
   }
 
+  saveBotState();
   res.json({ ok: true });
+});
+
+// ── Tunnel info ──────────────────────────────────────────────────────
+app.get("/api/tunnel-info", (_req, res) => {
+  res.json({
+    tunnelUrl: tunnelHttpUrl,
+    webhookUrl: tunnelHttpUrl ? `${tunnelHttpUrl}/webhooks/recall` : null,
+  });
 });
 
 // ── App Settings Endpoints ───────────────────────────────────────────
@@ -1136,6 +1186,10 @@ app.post("/api/bots/deploy", async (req, res) => {
       zoom: {
         breakout_room_handling: "auto_accept_all_invites",
       },
+      automatic_leave: {
+        everyone_left_timeout: { timeout: 600, activate_after: 1 },
+        noone_joined_timeout: 600,
+      },
     };
 
     // Real-time transcription via WebSocket (persistent connection, lowest latency)
@@ -1145,6 +1199,18 @@ app.post("/api/bots/deploy", async (req, res) => {
         type: "websocket",
         url: `${tunnelWsUrl}/ws/recall-transcript`,
         events: ["transcript.data", "transcript.partial_data"],
+      });
+
+      // Status + breakout room events via per-bot webhook (doesn't need Svix dashboard)
+      botPayload.recording_config.realtime_endpoints.push({
+        type: "webhook",
+        url: `${tunnelHttpUrl}/webhooks/recall`,
+        events: [
+          "bot.breakout_room_entered",
+          "bot.breakout_room_left",
+          "bot.breakout_room_opened",
+          "bot.breakout_room_closed",
+        ],
       });
     }
 
@@ -1209,6 +1275,7 @@ app.post("/api/bots/deploy", async (req, res) => {
         breakoutRoom: null,
         meetingUrl: meeting_url,
         createdAt: new Date().toISOString(),
+        meetingParticipants: [],
       };
 
       bots.set(localId, record);
@@ -1220,6 +1287,7 @@ app.post("/api/bots/deploy", async (req, res) => {
     }
   }
 
+  saveBotState();
   res.json({ created, errors, mode: tunnelHttpUrl ? "webpage" : "api" });
 });
 
@@ -1237,7 +1305,21 @@ app.get("/api/bots", async (_req, res) => {
         const latest =
           data.status_changes?.[data.status_changes.length - 1];
         if (latest) {
-          bot.status = latest.code?.replace("bot.", "") || bot.status;
+          const newStatus = latest.code?.replace("bot.", "") || bot.status;
+          bot.status = newStatus;
+
+          // Sync breakout room state from polling
+          if (newStatus === "in_breakout_room" && !bot.breakoutRoom) {
+            bot.breakoutRoom = "Breakout Room";
+          } else if (newStatus !== "in_breakout_room" && bot.breakoutRoom) {
+            bot.breakoutRoom = null;
+          }
+        }
+        if (Array.isArray(data.meeting_participants)) {
+          bot.meetingParticipants = data.meeting_participants.map((p: any) => ({
+            id: p.id,
+            name: p.name || "Unknown",
+          }));
         }
       }
     } catch {
@@ -1245,6 +1327,7 @@ app.get("/api/bots", async (_req, res) => {
     }
   }
 
+  saveBotState();
   res.json(Array.from(bots.values()));
 });
 
@@ -1382,6 +1465,7 @@ app.post("/api/bots/remove-all", async (_req, res) => {
   // Clear local state so new deploys start fresh
   bots.clear();
   botCounter = 0;
+  saveBotState();
 
   res.json({ results });
 });
@@ -1432,6 +1516,7 @@ app.post("/api/bots/force-remove-all", async (_req, res) => {
     }
 
     bots.clear();
+    saveBotState();
   } catch (err: any) {
     res.status(500).json({ error: err.message });
     return;
@@ -1832,6 +1917,7 @@ async function forceRemoveAllBots() {
     } catch {}
   }
   bots.clear();
+  saveBotState();
   return total;
 }
 
@@ -1871,8 +1957,13 @@ server.on("upgrade", (req, socket, head) => {
 server.listen(PORT, async () => {
   console.log(`[server] Backend running on http://localhost:${PORT}`);
 
-  // Recover any active bots from Recall API (e.g. after accidental crash)
-  recoverBots().catch((err) =>
+  // Restore saved state first, then recover from Recall API
+  loadBotState().then((restored) => {
+    if (restored) {
+      console.log("[server] Bot state restored from file, refreshing from Recall API...");
+    }
+    return recoverBots();
+  }).catch((err) =>
     console.error("[server] Bot recovery failed:", err)
   );
 
@@ -1887,6 +1978,7 @@ server.listen(PORT, async () => {
     startCloudflared().then((url) => {
       if (url) {
         console.log(`[server] Output Media (30fps): ${url}/output-media`);
+        console.log(`[server] ⚡ Webhook URL for Recall dashboard: ${url}/webhooks/recall`);
       } else {
         console.log(`[server] cloudflared failed — bot camera disabled`);
       }

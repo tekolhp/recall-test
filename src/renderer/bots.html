@@ -183,6 +183,29 @@
       margin-top: 2px;
     }
     .bot-tile-transcript:empty { display: none; }
+    .transcript-line {
+      display: flex;
+      align-items: flex-start;
+      gap: 6px;
+      margin-bottom: 3px;
+    }
+    .speaker-avatar {
+      width: 18px;
+      height: 18px;
+      border-radius: 50%;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 9px;
+      font-weight: 700;
+      color: #fff;
+      flex-shrink: 0;
+      margin-top: 1px;
+    }
+    .transcript-line-text {
+      flex: 1;
+      min-width: 0;
+    }
     .bot-tile-transcript .speaker {
       color: #4f8eff;
       font-weight: 500;
@@ -440,6 +463,98 @@
       color: #555;
     }
     .stream-info .rate { color: #4f8eff; }
+
+    /* ── Breakout room grouping ────────────────── */
+    .room-section {
+      background: #111;
+      border: 1px solid #222;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .room-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 14px;
+      border-bottom: 1px solid #222;
+      font-size: 13px;
+      font-weight: 600;
+      color: #ddd;
+    }
+    .room-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .room-count {
+      font-weight: 400;
+      font-size: 11px;
+      color: #666;
+      margin-left: auto;
+    }
+    .room-participants {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 8px 14px 0;
+    }
+    .room-participants:empty { display: none; }
+    .room-participant {
+      font-size: 11px;
+      color: #aaa;
+      background: #1a1a1a;
+      padding: 3px 8px;
+      border-radius: 10px;
+      border: 1px solid #2a2a2a;
+    }
+    .room-bots {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 6px;
+    }
+
+    /* ── URL history dropdown ─────────────────── */
+    .url-wrap {
+      position: relative;
+      flex: 1;
+      min-width: 240px;
+    }
+    .url-wrap input[type="text"] { width: 100%; min-width: 0; }
+    .url-history {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-top: none;
+      border-radius: 0 0 4px 4px;
+      max-height: 180px;
+      overflow-y: auto;
+      z-index: 100;
+    }
+    .url-history.open { display: block; }
+    .url-history-item {
+      padding: 7px 10px;
+      font-size: 12px;
+      color: #ccc;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .url-history-item:hover { background: #252525; }
+    .url-history-item .url-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .url-history-item .url-remove {
+      color: #555;
+      font-size: 14px;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .url-history-item .url-remove:hover { color: #ff4f4f; }
   </style>
 </head>
 <body>
@@ -460,7 +575,10 @@
   </nav>
 
   <div class="controls">
-    <input type="text" id="meeting-url" placeholder="Zoom meeting URL (https://us02web.zoom.us/j/...)" />
+    <div class="url-wrap">
+      <input type="text" id="meeting-url" placeholder="Zoom meeting URL (https://us02web.zoom.us/j/...)" autocomplete="off" />
+      <div class="url-history" id="url-history"></div>
+    </div>
     <input type="text" class="prefix" id="name-prefix" placeholder="Bot name" value="Helper" />
     <select id="bot-count">
       <option value="1" selected>1</option>

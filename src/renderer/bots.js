@@ -88,6 +88,42 @@ let outputToggleBusy = false;
 
 const bridge = window.recallBridge;
 
+// ── Speaker avatar helpers ──────────────────────────────────────────
+const AVATAR_COLORS = [
+  "#4f8eff", "#00cc6a", "#ff9f43", "#ff6b6b", "#a55eea",
+  "#2ed573", "#ffa502", "#ff4757", "#1e90ff", "#ff6348",
+];
+
+function speakerColor(name) {
+  if (!name) return "#666";
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+}
+
+function speakerInitials(name) {
+  if (!name) return "?";
+  const parts = name.trim().split(/\s+/);
+  if (parts.length >= 2) return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
+  return parts[0][0].toUpperCase();
+}
+
+function createAvatarElement(name) {
+  const avatar = document.createElement("span");
+  avatar.className = "speaker-avatar";
+  avatar.style.background = speakerColor(name);
+  avatar.textContent = speakerInitials(name);
+  return avatar;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement("div");
+  div.textContent = str;
+  return div.innerHTML;
+}
+
 // ── Preview management ───────────────────────────────────────────────
 // Shows the correct preview element based on active output type
 function showPreview(type) {
@@ -155,28 +191,48 @@ function connectTranscriptSocket() {
       }
 
       if (data.is_final) {
-        // Remove the partial line if it exists
         const partial = el.querySelector(".partial");
         if (partial) partial.remove();
-        // Add final line
+
         const line = document.createElement("div");
-        line.textContent = data.text;
+        line.className = "transcript-line";
+        if (data.speaker) {
+          line.appendChild(createAvatarElement(data.speaker));
+          const textWrap = document.createElement("span");
+          textWrap.className = "transcript-line-text";
+          const speakerSpan = document.createElement("span");
+          speakerSpan.className = "speaker";
+          speakerSpan.textContent = data.speaker + ": ";
+          textWrap.appendChild(speakerSpan);
+          textWrap.appendChild(document.createTextNode(data.text));
+          line.appendChild(textWrap);
+        } else {
+          line.textContent = data.text;
+        }
         el.appendChild(line);
       } else {
-        // Replace existing partial or create one
         let partial = el.querySelector(".partial");
         if (!partial) {
           partial = document.createElement("div");
-          partial.className = "partial";
+          partial.className = "partial transcript-line";
           partial.style.color = "#666";
           partial.style.fontStyle = "italic";
           el.appendChild(partial);
         }
-        partial.textContent = data.text;
+        partial.innerHTML = "";
+        if (data.speaker) {
+          partial.appendChild(createAvatarElement(data.speaker));
+          const textSpan = document.createElement("span");
+          textSpan.className = "transcript-line-text";
+          textSpan.textContent = data.speaker + ": " + data.text;
+          partial.appendChild(textSpan);
+        } else {
+          partial.textContent = data.text;
+        }
       }
 
       // Keep only last 20 final lines
-      const finals = el.querySelectorAll("div:not(.partial)");
+      const finals = el.querySelectorAll(".transcript-line:not(.partial)");
       while (finals.length > 20) el.removeChild(finals[0]);
       el.scrollTop = el.scrollHeight;
     } catch {}
@@ -190,6 +246,26 @@ function connectTranscriptSocket() {
 
 connectTranscriptSocket();
 checkNgrokStatus();
+
+// Show webhook URL in status bar for Recall dashboard configuration
+(async () => {
+  try {
+    const info = await bridge.getTunnelInfo();
+    if (info?.webhookUrl) {
+      statusBar.innerHTML = `Webhook: <span style="color:#4f8eff;cursor:pointer;text-decoration:underline" id="webhook-url">${info.webhookUrl}</span> <span style="color:#555">(click to copy — set this in Recall dashboard → Webhooks)</span>`;
+      document.getElementById("webhook-url")?.addEventListener("click", () => {
+        navigator.clipboard.writeText(info.webhookUrl);
+        statusBar.textContent = "Webhook URL copied to clipboard!";
+        setTimeout(async () => {
+          const fresh = await bridge.getTunnelInfo();
+          if (fresh?.webhookUrl) {
+            statusBar.innerHTML = `Webhook: <span style="color:#4f8eff">${fresh.webhookUrl}</span>`;
+          }
+        }, 2000);
+      });
+    }
+  } catch {}
+})();
 
 // ── Listen for toggle state changes ───────────────────────────────────
 if (bridge.onToggleState) {
@@ -212,6 +288,89 @@ if (bridge.onToggleState) {
   });
 }
 
+// ── URL history ──────────────────────────────────────────────────────
+const urlHistoryEl = document.getElementById("url-history");
+const URL_HISTORY_KEY = "meetingUrlHistory";
+const MAX_URL_HISTORY = 10;
+
+function getUrlHistory() {
+  try { return JSON.parse(localStorage.getItem(URL_HISTORY_KEY) || "[]"); }
+  catch { return []; }
+}
+
+function saveUrlToHistory(url) {
+  let history = getUrlHistory().filter((u) => u !== url);
+  history.unshift(url);
+  if (history.length > MAX_URL_HISTORY) history = history.slice(0, MAX_URL_HISTORY);
+  localStorage.setItem(URL_HISTORY_KEY, JSON.stringify(history));
+}
+
+function removeUrlFromHistory(url) {
+  const history = getUrlHistory().filter((u) => u !== url);
+  localStorage.setItem(URL_HISTORY_KEY, JSON.stringify(history));
+  renderUrlHistory();
+}
+
+function renderUrlHistory() {
+  const history = getUrlHistory();
+  if (history.length === 0) {
+    urlHistoryEl.classList.remove("open");
+    return;
+  }
+  urlHistoryEl.innerHTML = history.map((url) =>
+    `<div class="url-history-item" data-url="${escapeHtml(url)}">
+      <span class="url-text">${escapeHtml(url)}</span>
+      <span class="url-remove" data-remove="${escapeHtml(url)}">&times;</span>
+    </div>`
+  ).join("");
+  urlHistoryEl.classList.add("open");
+}
+
+meetingUrlInput.addEventListener("focus", () => {
+  if (getUrlHistory().length > 0) renderUrlHistory();
+});
+
+meetingUrlInput.addEventListener("input", () => {
+  const val = meetingUrlInput.value.trim().toLowerCase();
+  const history = getUrlHistory();
+  const filtered = val ? history.filter((u) => u.toLowerCase().includes(val)) : history;
+  if (filtered.length === 0) {
+    urlHistoryEl.classList.remove("open");
+    return;
+  }
+  urlHistoryEl.innerHTML = filtered.map((url) =>
+    `<div class="url-history-item" data-url="${escapeHtml(url)}">
+      <span class="url-text">${escapeHtml(url)}</span>
+      <span class="url-remove" data-remove="${escapeHtml(url)}">&times;</span>
+    </div>`
+  ).join("");
+  urlHistoryEl.classList.add("open");
+});
+
+urlHistoryEl.addEventListener("click", (e) => {
+  const removeBtn = e.target.closest("[data-remove]");
+  if (removeBtn) {
+    e.stopPropagation();
+    removeUrlFromHistory(removeBtn.dataset.remove);
+    return;
+  }
+  const item = e.target.closest(".url-history-item");
+  if (item) {
+    meetingUrlInput.value = item.dataset.url;
+    urlHistoryEl.classList.remove("open");
+  }
+});
+
+document.addEventListener("click", (e) => {
+  if (!e.target.closest(".url-wrap")) urlHistoryEl.classList.remove("open");
+});
+
+// Restore last used URL on load
+const lastHistory = getUrlHistory();
+if (lastHistory.length > 0 && !meetingUrlInput.value) {
+  meetingUrlInput.value = lastHistory[0];
+}
+
 // ── Deploy ────────────────────────────────────────────────────────────
 btnDeploy.addEventListener("click", async () => {
   const meetingUrl = meetingUrlInput.value.trim();
@@ -219,6 +378,9 @@ btnDeploy.addEventListener("click", async () => {
     meetingUrlInput.focus();
     return;
   }
+
+  saveUrlToHistory(meetingUrl);
+  urlHistoryEl.classList.remove("open");
 
   const botCount = parseInt(botCountSelect.value, 10);
   const namePrefix = namePrefixInput.value.trim() || "Assistant";
@@ -247,6 +409,7 @@ btnDeploy.addEventListener("click", async () => {
     }
 
     renderBots();
+
     startPolling();
     btnRemoveAll.disabled = false;
   } catch (err) {
@@ -268,6 +431,7 @@ btnRemoveAll.addEventListener("click", async () => {
     stopPolling();
     activeBots = [];
     renderBots();
+
     statusBar.textContent = "All bots removed";
     btnRemoveAll.disabled = true;
   } catch (err) {
@@ -289,6 +453,7 @@ btnForceRemove.addEventListener("click", async () => {
     stopPolling();
     activeBots = [];
     renderBots();
+
     btnRemoveAll.disabled = true;
 
     statusBar.textContent = result.error
@@ -451,6 +616,8 @@ function updateTilePreview(botId, b64) {
 }
 
 // ── Render bot tiles ──────────────────────────────────────────────────
+const ROOM_COLORS = ["#00ff88", "#ff9f43", "#ff6b6b", "#a55eea", "#2ed573", "#ffa502", "#ff4757"];
+
 function renderBots() {
   if (activeBots.length === 0) {
     botGrid.innerHTML = "";
@@ -461,28 +628,123 @@ function renderBots() {
 
   emptyState.style.display = "none";
 
-  const existingTiles = new Map();
-  botGrid.querySelectorAll(".bot-tile").forEach((tile) => {
-    existingTiles.set(tile.dataset.botId, tile);
-  });
+  const hasBreakoutRooms = activeBots.some((b) => b.breakoutRoom);
 
+  if (hasBreakoutRooms) {
+    renderBotsGrouped();
+  } else {
+    // Flat list — remove any leftover room sections
+    botGrid.querySelectorAll(".room-section").forEach((s) => s.remove());
+
+    const existingTiles = new Map();
+    botGrid.querySelectorAll(":scope > .bot-tile").forEach((tile) => {
+      existingTiles.set(tile.dataset.botId, tile);
+    });
+    botGrid.querySelectorAll(".empty-state").forEach((el) => el.remove());
+
+    for (const bot of activeBots) {
+      let tile = existingTiles.get(bot.id);
+      if (!tile) {
+        tile = createBotTile(bot);
+        botGrid.appendChild(tile);
+      } else {
+        updateBotTile(tile, bot);
+        existingTiles.delete(bot.id);
+      }
+    }
+    for (const [, tile] of existingTiles) tile.remove();
+  }
+}
+
+function renderBotsGrouped() {
+  // Remove any flat tiles sitting directly in bot-grid
+  botGrid.querySelectorAll(":scope > .bot-tile").forEach((t) => t.remove());
   botGrid.querySelectorAll(".empty-state").forEach((el) => el.remove());
 
+  // Group bots by breakout room
+  const groups = new Map();
   for (const bot of activeBots) {
-    let tile = existingTiles.get(bot.id);
+    const room = bot.breakoutRoom || "Main Room";
+    if (!groups.has(room)) groups.set(room, []);
+    groups.get(room).push(bot);
+  }
 
-    if (!tile) {
-      tile = createBotTile(bot);
-      botGrid.appendChild(tile);
-    } else {
-      updateBotTile(tile, bot);
-      existingTiles.delete(bot.id);
+  // Sort: Main Room first, then alphabetical
+  const sortedRooms = [...groups.keys()].sort((a, b) => {
+    if (a === "Main Room") return -1;
+    if (b === "Main Room") return 1;
+    return a.localeCompare(b);
+  });
+
+  const existingSections = new Map();
+  botGrid.querySelectorAll(".room-section").forEach((sec) => {
+    existingSections.set(sec.dataset.room, sec);
+  });
+
+  let colorIdx = 0;
+  for (const room of sortedRooms) {
+    const bots = groups.get(room);
+    const color = room === "Main Room" ? "#4f8eff" : ROOM_COLORS[colorIdx++ % ROOM_COLORS.length];
+
+    // Collect unique participants across all bots in this room
+    const participantMap = new Map();
+    for (const bot of bots) {
+      for (const p of (bot.meetingParticipants || [])) {
+        if (!participantMap.has(p.id)) participantMap.set(p.id, p.name);
+      }
     }
+    const participants = [...participantMap.values()];
+
+    let section = existingSections.get(room);
+    if (!section) {
+      section = document.createElement("div");
+      section.className = "room-section";
+      section.dataset.room = room;
+      section.innerHTML = `
+        <div class="room-header">
+          <span class="room-dot" style="background:${color}"></span>
+          <span class="room-name">${room}</span>
+          <span class="room-count">${bots.length} bot(s)</span>
+        </div>
+        <div class="room-participants"></div>
+        <div class="room-bots"></div>
+      `;
+      botGrid.appendChild(section);
+    } else {
+      section.querySelector(".room-count").textContent = `${bots.length} bot(s)`;
+      section.querySelector(".room-dot").style.background = color;
+      existingSections.delete(room);
+    }
+
+    // Update participant list
+    const pEl = section.querySelector(".room-participants");
+    if (participants.length > 0) {
+      pEl.innerHTML = participants.map((name) =>
+        `<span class="room-participant">${name}</span>`
+      ).join("");
+    } else {
+      pEl.innerHTML = "";
+    }
+
+    const container = section.querySelector(".room-bots");
+    const existingTiles = new Map();
+    container.querySelectorAll(".bot-tile").forEach((t) => existingTiles.set(t.dataset.botId, t));
+
+    for (const bot of bots) {
+      let tile = existingTiles.get(bot.id);
+      if (!tile) {
+        tile = createBotTile(bot);
+        container.appendChild(tile);
+      } else {
+        updateBotTile(tile, bot);
+        existingTiles.delete(bot.id);
+      }
+    }
+    for (const [, tile] of existingTiles) tile.remove();
   }
 
-  for (const [, tile] of existingTiles) {
-    tile.remove();
-  }
+  // Remove sections for rooms that no longer exist
+  for (const [, sec] of existingSections) sec.remove();
 }
 
 // HLS players (kept for potential future use)
@@ -613,6 +875,7 @@ function startPolling() {
       if (Array.isArray(bots)) {
         activeBots = bots;
         renderBots();
+    
 
         const active = bots.filter(
           (b) => !["done", "fatal"].includes(b.status)
@@ -668,10 +931,16 @@ async function updateTranscript(botId) {
         const text =
           seg.words?.map((w) => w.text).join(" ") || seg.text || "";
         if (!text.trim()) return null;
-        return text;
+        const speaker = seg.participant?.name || seg.speaker || "";
+        if (speaker) {
+          const color = speakerColor(speaker);
+          const initials = escapeHtml(speakerInitials(speaker));
+          return `<div class="transcript-line"><span class="speaker-avatar" style="background:${color}">${initials}</span><span class="transcript-line-text"><span class="speaker">${escapeHtml(speaker)}:</span> ${escapeHtml(text)}</span></div>`;
+        }
+        return `<div class="transcript-line">${escapeHtml(text)}</div>`;
       })
       .filter(Boolean)
-      .join("<br>");
+      .join("");
 
     if (html && html !== el.innerHTML) {
       el.innerHTML = html;
@@ -1365,6 +1634,7 @@ toggleAudio.addEventListener("click", async () => {
         if (active.length > 0) {
           activeBots = active;
           renderBots();
+      
           startPolling();
           btnRemoveAll.disabled = false;
           statusBar.textContent = `Recovered ${active.length} active bot(s)`;

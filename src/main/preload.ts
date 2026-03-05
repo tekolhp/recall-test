@@ -74,6 +74,7 @@ contextBridge.exposeInMainWorld("recallBridge", {
     ipcRenderer.invoke("activate-output-media"),
   deactivateOutputMedia: () =>
     ipcRenderer.invoke("deactivate-output-media"),
+  getTunnelInfo: () => ipcRenderer.invoke("get-tunnel-info"),
   getNgrokStatus: () => ipcRenderer.invoke("get-ngrok-status"),
   uploadVideo: (fileName: string, buffer: ArrayBuffer) =>
     ipcRenderer.invoke("upload-video", fileName, Buffer.from(buffer)),

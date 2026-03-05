@@ -645,6 +645,15 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.handle("get-tunnel-info", async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/tunnel-info`);
+      return await res.json();
+    } catch (err: any) {
+      return { tunnelUrl: null, webhookUrl: null };
+    }
+  });
+
   ipcMain.handle("get-ngrok-status", async () => {
     try {
       const res = await fetch(`${BACKEND_URL}/api/ngrok-status`);
