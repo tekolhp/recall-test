@@ -1201,17 +1201,8 @@ app.post("/api/bots/deploy", async (req, res) => {
         events: ["transcript.data", "transcript.partial_data"],
       });
 
-      // Status + breakout room events via per-bot webhook (doesn't need Svix dashboard)
-      botPayload.recording_config.realtime_endpoints.push({
-        type: "webhook",
-        url: `${tunnelHttpUrl}/webhooks/recall`,
-        events: [
-          "bot.breakout_room_entered",
-          "bot.breakout_room_left",
-          "bot.breakout_room_opened",
-          "bot.breakout_room_closed",
-        ],
-      });
+      // Note: breakout room events are only delivered via Svix dashboard webhooks,
+      // not via per-bot realtime_endpoints. Set the webhook URL in the Recall dashboard.
     }
 
     // RTMP streaming: receive live 720p/30fps video from the meeting
