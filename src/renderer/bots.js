@@ -142,6 +142,152 @@ function showPreview(type) {
   }
 }
 
+// ── Drag-and-drop on preview area ────────────────────────────────────
+const streamPreview = document.querySelector(".stream-preview");
+
+streamPreview.addEventListener("dragover", (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  streamPreview.style.outline = "2px solid #4f8eff";
+  streamPreview.style.outlineOffset = "-2px";
+});
+
+streamPreview.addEventListener("dragleave", (e) => {
+  e.preventDefault();
+  streamPreview.style.outline = "";
+  streamPreview.style.outlineOffset = "";
+});
+
+streamPreview.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  e.stopPropagation();
+  streamPreview.style.outline = "";
+  streamPreview.style.outlineOffset = "";
+
+  const file = e.dataTransfer?.files?.[0];
+  if (!file) return;
+
+  const type = file.type || "";
+
+  if (type.startsWith("image/")) {
+    // ── Image drop: load, broadcast, and activate ──
+    if (outputToggleBusy) return;
+    outputToggleBusy = true;
+    deactivateAllOutputs();
+    toggleImage.classList.add("on", "busy");
+
+    // Load image into base64 via canvas (reuse existing logic)
+    const reader = new FileReader();
+    reader.onload = async () => {
+      const dataUrl = reader.result;
+      const img = new Image();
+      img.onload = async () => {
+        const hiRes = document.createElement("canvas");
+        hiRes.width = 2560; hiRes.height = 1440;
+        const hiCtx = hiRes.getContext("2d");
+        hiCtx.fillStyle = "#000";
+        hiCtx.fillRect(0, 0, 2560, 1440);
+        const scale = Math.min(2560 / img.width, 1440 / img.height);
+        const w = img.width * scale, h = img.height * scale;
+        hiCtx.drawImage(img, (2560 - w) / 2, (1440 - h) / 2, w, h);
+        const canvas = document.createElement("canvas");
+        canvas.width = 1280; canvas.height = 720;
+        const ctx = canvas.getContext("2d");
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+        ctx.drawImage(hiRes, 0, 0, 1280, 720);
+        pendingImageB64 = canvas.toDataURL("image/jpeg", 0.95).split(",")[1];
+
+        try {
+          await bridge.deactivateOutputMedia().catch(() => {});
+          const result = await bridge.broadcastImage(pendingImageB64);
+          if (result.error) throw new Error(result.error);
+          streamImage.src = `data:image/jpeg;base64,${pendingImageB64}`;
+          showPreview("image");
+          indImage.classList.add("active");
+          statusBar.textContent = `Image sent to ${result.sent} bot(s)`;
+        } catch (err) {
+          toggleImage.classList.remove("on");
+          indImage.classList.remove("active");
+          statusBar.textContent = `Image failed: ${err.message}`;
+        } finally {
+          toggleImage.classList.remove("busy");
+          outputToggleBusy = false;
+        }
+      };
+      img.src = dataUrl;
+    };
+    reader.readAsDataURL(file);
+
+  } else if (type.startsWith("video/")) {
+    // ── Video drop: upload and activate ──
+    if (outputToggleBusy) return;
+    statusBar.textContent = "Uploading video...";
+    try {
+      const buffer = await file.arrayBuffer();
+      const result = await bridge.uploadVideo(file.name, buffer);
+      if (result.error) { statusBar.textContent = `Video upload failed: ${result.error}`; return; }
+
+      if (videoFileUrl) URL.revokeObjectURL(videoFileUrl);
+      videoFileUrl = URL.createObjectURL(file);
+      videoUploaded = true;
+      btnPickVideo.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+      statusBar.textContent = `Video uploaded: ${file.name}`;
+
+      // Auto-activate
+      outputToggleBusy = true;
+      deactivateAllOutputs();
+      toggleVideo.classList.add("on", "busy");
+      try {
+        await activateVideoOutput();
+      } catch (err) {
+        toggleVideo.classList.remove("on");
+        indVideo.classList.remove("active");
+        statusBar.textContent = `Video failed: ${err.message}`;
+      } finally {
+        toggleVideo.classList.remove("busy");
+        outputToggleBusy = false;
+      }
+    } catch (err) {
+      statusBar.textContent = `Video upload failed: ${err.message}`;
+    }
+
+  } else if (type.startsWith("audio/")) {
+    // ── Audio/Music drop: upload and activate ──
+    if (outputToggleBusy) return;
+    statusBar.textContent = "Uploading music...";
+    try {
+      const buffer = await file.arrayBuffer();
+      const result = await bridge.uploadMusic(file.name, buffer);
+      if (result.error) { statusBar.textContent = `Music upload failed: ${result.error}`; return; }
+
+      musicUploaded = true;
+      btnPickMusic.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+      statusBar.textContent = `Music uploaded: ${file.name}`;
+
+      // Auto-activate
+      outputToggleBusy = true;
+      deactivateAllOutputs();
+      toggleMusic.classList.add("on", "busy");
+      try {
+        await activateMusicOutput();
+      } catch (err) {
+        toggleMusic.classList.remove("on");
+        indMusic.classList.remove("active");
+        statusBar.textContent = `Music failed: ${err.message}`;
+      } finally {
+        toggleMusic.classList.remove("busy");
+        outputToggleBusy = false;
+      }
+    } catch (err) {
+      statusBar.textContent = `Music upload failed: ${err.message}`;
+    }
+
+  } else {
+    statusBar.textContent = `Unsupported file type: ${type || "unknown"}`;
+  }
+});
+
 // ── Check tunnel status ──────────────────────────────────────────────
 async function checkNgrokStatus() {
   try {

@@ -326,15 +326,17 @@
     /* ── Stream panel ───────────────────────────── */
     .stream-panel {
       display: flex;
+      flex-direction: column;
       padding: 12px 16px;
       background: #0d0d0d;
       border-bottom: 1px solid #1a1a1a;
-      gap: 12px;
-      align-items: flex-start;
+      gap: 10px;
+      align-items: center;
     }
     .stream-preview {
-      width: 240px;
-      height: 135px;
+      width: 100%;
+      max-width: 480px;
+      aspect-ratio: 16/9;
       background: #000;
       border-radius: 6px;
       overflow: hidden;
@@ -355,6 +357,11 @@
       color: #444;
       font-size: 11px;
       text-align: center;
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     .stream-preview .preview-placeholder.hidden { display: none; }
     /* ── Output feature rows ──────────────── */
@@ -362,7 +369,8 @@
       display: flex;
       flex-direction: column;
       gap: 6px;
-      flex: 1;
+      width: 100%;
+      max-width: 480px;
     }
     .feature-row {
       display: flex;
@@ -605,7 +613,7 @@
       <video id="stream-video" muted autoplay playsinline></video>
       <img id="stream-image" />
       <canvas id="stream-canvas" width="1280" height="720"></canvas>
-      <span class="preview-placeholder" id="preview-placeholder">No active feed</span>
+      <span class="preview-placeholder" id="preview-placeholder">Drop image, video, or audio here</span>
     </div>
     <div class="output-features">
       <div class="feature-row">
@@ -617,24 +625,6 @@
         </select>
         <div class="feature-toggle" id="toggle-camera"></div>
         <div class="feature-indicator" id="ind-camera"></div>
-      </div>
-      <div class="feature-row">
-        <span class="feature-label">Image</span>
-        <button class="feature-btn" id="btn-pick-image">Choose File</button>
-        <div class="feature-toggle" id="toggle-image"></div>
-        <div class="feature-indicator" id="ind-image"></div>
-      </div>
-      <div class="feature-row">
-        <span class="feature-label">Video</span>
-        <button class="feature-btn" id="btn-pick-video">Choose File</button>
-        <div class="feature-toggle" id="toggle-video"></div>
-        <div class="feature-indicator" id="ind-video"></div>
-      </div>
-      <div class="feature-row">
-        <span class="feature-label">Music</span>
-        <button class="feature-btn" id="btn-pick-music">Choose File</button>
-        <div class="feature-toggle" id="toggle-music"></div>
-        <div class="feature-indicator" id="ind-music"></div>
       </div>
       <div class="feature-row">
         <span class="feature-label">URL</span>
@@ -652,6 +642,18 @@
       <div class="stream-info" id="stream-info">
         Video: stopped | Audio: stopped | Rate: <span class="rate">0 fps</span>
       </div>
+    </div>
+    <!-- Hidden elements for drag-drop features (Image/Video/Music still functional) -->
+    <div style="display:none">
+      <button id="btn-pick-image">Choose File</button>
+      <div class="feature-toggle" id="toggle-image"></div>
+      <div class="feature-indicator" id="ind-image"></div>
+      <button id="btn-pick-video">Choose File</button>
+      <div class="feature-toggle" id="toggle-video"></div>
+      <div class="feature-indicator" id="ind-video"></div>
+      <button id="btn-pick-music">Choose File</button>
+      <div class="feature-toggle" id="toggle-music"></div>
+      <div class="feature-indicator" id="ind-music"></div>
     </div>
   </div>
 
