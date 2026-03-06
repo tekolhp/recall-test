@@ -500,19 +500,18 @@ const wssAudio = new WebSocketServer({ noServer: true });
 wssAudio.on("connection", (ws) => {
   console.log("[ws-audio] Audio push client connected");
 
-  let ffmpeg: ChildProcess | null = null;
   let mp3Buffer: Buffer[] = [];
-  let flushInterval: ReturnType<typeof setInterval> | null = null;
+  let isSending = false;
+  let audioRunning = true;
 
-  // Spawn persistent ffmpeg: webm stdin → mp3 stdout
-  ffmpeg = nodeSpawn("ffmpeg", [
+  // Persistent ffmpeg: continuous webm stdin → mp3 stdout
+  const ffmpeg = nodeSpawn("ffmpeg", [
     "-f", "webm", "-i", "pipe:0",
-    "-codec:a", "libmp3lame", "-b:a", "128k",
+    "-codec:a", "libmp3lame", "-b:a", "64k", "-ar", "24000",
     "-f", "mp3", "pipe:1",
   ], { stdio: ["pipe", "pipe", "pipe"] });
 
   ffmpeg.stderr?.on("data", (d: Buffer) => {
-    // Suppress ffmpeg logs (too noisy), only log errors
     const msg = d.toString();
     if (msg.includes("Error") || msg.includes("error")) {
       console.error(`[ws-audio:ffmpeg] ${msg.trim()}`);
@@ -525,55 +524,59 @@ wssAudio.on("connection", (ws) => {
 
   ffmpeg.on("exit", (code) => {
     console.log(`[ws-audio] ffmpeg exited with code ${code}`);
-    ffmpeg = null;
   });
 
-  // Every 3 seconds, flush accumulated MP3 bytes to all active bots
-  flushInterval = setInterval(async () => {
-    if (mp3Buffer.length === 0) return;
+  // Send accumulated mp3 every 3s — sequential, no overlap
+  const flushInterval = setInterval(async () => {
+    if (isSending || mp3Buffer.length === 0) return;
 
     const mp3Data = Buffer.concat(mp3Buffer);
     mp3Buffer = [];
+    if (mp3Data.length < 100) return;
 
-    if (mp3Data.length < 100) return; // too small, skip
-
-    const mp3B64 = mp3Data.toString("base64");
     const activeBotList = Array.from(bots.values()).filter(
       (b) => !["done", "fatal", "leaving"].includes(b.status)
     );
-
     if (activeBotList.length === 0) return;
 
-    const body = JSON.stringify({ data: { kind: "mp3", b64_data: mp3B64 } });
-    await Promise.allSettled(
-      activeBotList.map((bot) =>
-        fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_audio/`, {
-          method: "POST",
-          headers: {
-            Authorization: `Token ${API_KEY}`,
-            "Content-Type": "application/json",
-          },
-          body,
-        })
-      )
-    );
+    isSending = true;
+    const body = JSON.stringify({ kind: "mp3", b64_data: mp3Data.toString("base64") });
+    try {
+      await Promise.allSettled(
+        activeBotList.map((bot) =>
+          fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_audio/`, {
+            method: "POST",
+            headers: {
+              Authorization: `Token ${API_KEY}`,
+              "Content-Type": "application/json",
+            },
+            body,
+          }).then(async (r) => {
+            if (!r.ok) {
+              const text = await r.text().catch(() => "");
+              console.error(`[ws-audio] output_audio ${bot.recallBotId}: ${r.status} ${text}`);
+            }
+          })
+        )
+      );
+    } finally {
+      isSending = false;
+    }
   }, 3000);
 
   ws.on("message", (data: Buffer) => {
-    // Write raw webm chunk to ffmpeg stdin
-    if (ffmpeg && ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
+    // Write raw webm chunk to ffmpeg stdin (continuous stream)
+    if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) {
       ffmpeg.stdin.write(data);
     }
   });
 
   ws.on("close", () => {
     console.log("[ws-audio] Audio push client disconnected");
-    if (flushInterval) { clearInterval(flushInterval); flushInterval = null; }
-    if (ffmpeg) {
-      ffmpeg.stdin?.end();
-      ffmpeg.kill("SIGTERM");
-      ffmpeg = null;
-    }
+    audioRunning = false;
+    clearInterval(flushInterval);
+    if (ffmpeg.stdin && !ffmpeg.stdin.destroyed) ffmpeg.stdin.end();
+    ffmpeg.kill("SIGTERM");
     mp3Buffer = [];
   });
 });
@@ -1875,7 +1878,7 @@ app.post("/api/bots/:id/send-audio", async (req, res) => {
           Authorization: `Token ${API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ data: { kind: "mp3", b64_data } }),
+        body: JSON.stringify({ kind: "mp3", b64_data }),
       }
     );
 
@@ -1932,7 +1935,7 @@ app.post("/api/bots/:id/send-audio-webm", async (req, res) => {
           Authorization: `Token ${API_KEY}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ data: { kind: "mp3", b64_data: mp3B64 } }),
+        body: JSON.stringify({ kind: "mp3", b64_data: mp3B64 }),
       }
     );
 
@@ -1982,7 +1985,7 @@ app.post("/api/bots/broadcast-audio-webm", async (req, res) => {
       (b) => !["done", "fatal", "leaving"].includes(b.status)
     );
 
-    const body = JSON.stringify({ data: { kind: "mp3", b64_data: mp3B64 } });
+    const body = JSON.stringify({ kind: "mp3", b64_data: mp3B64 });
     const results = await Promise.allSettled(
       activeBotList.map((bot) =>
         fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_audio/`, {

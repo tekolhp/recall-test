@@ -405,6 +405,12 @@
       background: #151515;
       border-radius: 6px;
       border: 1px solid #222;
+      cursor: pointer;
+      user-select: none;
+    }
+    .feature-row:not(:has(.feature-indicator.active)):not(:has(.feature-toggle.busy)):hover {
+      background: #1a1a1a;
+      border-color: #333;
     }
     .feature-row .feature-label {
       font-size: 12px;
@@ -491,6 +497,36 @@
       background: #00ff88;
       box-shadow: 0 0 6px #00ff8866;
     }
+
+    /* Hide toggle switches and indicator dots in the output feature rows */
+    .output-features > .feature-row > .feature-toggle,
+    .output-features > .feature-row > .feature-indicator {
+      display: none;
+    }
+
+    /* Feature row state colors (derived from child toggle/indicator state) */
+    .feature-row {
+      transition: background 0.3s, border-color 0.3s;
+    }
+    .feature-row:has(.feature-indicator.active) {
+      border-color: #00cc6a;
+      background: #0d1f0d;
+    }
+    .feature-row:has(.feature-toggle.busy) {
+      border-color: #ffab00;
+      background: #1f1a0d;
+    }
+
+    /* Panel section titles */
+    .panel-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: #666;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      padding-bottom: 2px;
+    }
+
     .stream-info {
       font-size: 11px;
       color: #555;
@@ -636,6 +672,7 @@
   <div class="main-columns">
     <!-- Left: Stream panel -->
     <div class="stream-panel" id="stream-panel">
+      <div class="panel-title">Bots Feed</div>
       <div class="stream-preview">
         <video id="stream-video" muted autoplay playsinline></video>
         <img id="stream-image" />
@@ -643,49 +680,62 @@
         <span class="preview-placeholder" id="preview-placeholder">Drop image, video, or audio here</span>
       </div>
       <div class="output-features">
-        <div class="feature-row">
+        <div class="feature-row" id="row-camera">
           <span class="feature-label">Camera</span>
           <select id="camera-source">
             <option value="">-- Source --</option>
-            <option value="camera">Webcam</option>
-            <option value="screen">Screen</option>
+            <option value="screen">Screen Capture</option>
           </select>
           <div class="feature-toggle" id="toggle-camera"></div>
           <div class="feature-indicator" id="ind-camera"></div>
         </div>
-        <div class="feature-row">
+        <div class="feature-row" id="row-url">
           <span class="feature-label">URL</span>
           <input type="text" class="feature-url-input" id="url-input" placeholder="https://example.com/page" />
-          <button class="feature-btn" id="btn-send-url" style="flex:none;width:auto;padding:5px 10px;">Send</button>
           <div class="feature-toggle" id="toggle-url"></div>
           <div class="feature-indicator" id="ind-url"></div>
         </div>
-        <div class="feature-row">
+        <div class="feature-row" id="row-audio">
           <span class="feature-label">Audio</span>
-          <button class="feature-btn" id="btn-audio-cfg" disabled>Microphone</button>
+          <select id="audio-source">
+            <option value="">-- Device --</option>
+          </select>
           <div class="feature-toggle" id="toggle-audio"></div>
           <div class="feature-indicator" id="ind-audio"></div>
+        </div>
+        <div class="feature-row" id="row-image">
+          <span class="feature-label">Image</span>
+          <span class="feature-file-name" id="image-file-name" style="flex:1;font-size:12px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Upload</span>
+          <div class="feature-toggle" id="toggle-image"></div>
+          <div class="feature-indicator" id="ind-image"></div>
+        </div>
+        <div class="feature-row" id="row-video">
+          <span class="feature-label">Video</span>
+          <span class="feature-file-name" id="video-file-name" style="flex:1;font-size:12px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Upload</span>
+          <div class="feature-toggle" id="toggle-video"></div>
+          <div class="feature-indicator" id="ind-video"></div>
+        </div>
+        <div class="feature-row" id="row-music">
+          <span class="feature-label">Music</span>
+          <span class="feature-file-name" id="music-file-name" style="flex:1;font-size:12px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Upload</span>
+          <div class="feature-toggle" id="toggle-music"></div>
+          <div class="feature-indicator" id="ind-music"></div>
         </div>
         <div class="stream-info" id="stream-info">
           Video: stopped | Audio: stopped | Rate: <span class="rate">0 fps</span>
         </div>
       </div>
-      <!-- Hidden elements for drag-drop features (Image/Video/Music still functional) -->
+      <!-- Hidden file inputs for native file pickers -->
       <div style="display:none">
         <button id="btn-pick-image">Choose File</button>
-        <div class="feature-toggle" id="toggle-image"></div>
-        <div class="feature-indicator" id="ind-image"></div>
         <button id="btn-pick-video">Choose File</button>
-        <div class="feature-toggle" id="toggle-video"></div>
-        <div class="feature-indicator" id="ind-video"></div>
         <button id="btn-pick-music">Choose File</button>
-        <div class="feature-toggle" id="toggle-music"></div>
-        <div class="feature-indicator" id="ind-music"></div>
       </div>
     </div>
 
     <!-- Center: Bot grid / breakout rooms -->
     <div class="bot-grid" id="bot-grid">
+      <div class="panel-title">Breakout Room Dashboard</div>
       <div class="empty-state" id="empty-state">
         <p>No bots deployed yet</p>
         <small>Enter a Zoom meeting URL and click Deploy Bots</small>

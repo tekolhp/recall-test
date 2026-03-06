@@ -42,11 +42,21 @@ const musicFileInput = document.getElementById("music-file-input");
 const toggleMusic = document.getElementById("toggle-music");
 const indMusic = document.getElementById("ind-music");
 const urlInput = document.getElementById("url-input");
-const btnSendUrl = document.getElementById("btn-send-url");
 const toggleUrl = document.getElementById("toggle-url");
 const indUrl = document.getElementById("ind-url");
 const toggleAudio = document.getElementById("toggle-audio");
 const indAudio = document.getElementById("ind-audio");
+
+// Feature row containers (clickable)
+const rowCamera = document.getElementById("row-camera");
+const rowUrl = document.getElementById("row-url");
+const rowAudio = document.getElementById("row-audio");
+const rowImage = document.getElementById("row-image");
+const rowVideo = document.getElementById("row-video");
+const rowMusic = document.getElementById("row-music");
+const imageFileName = document.getElementById("image-file-name");
+const videoFileName = document.getElementById("video-file-name");
+const musicFileName = document.getElementById("music-file-name");
 
 // Settings modal
 const btnSettings = document.getElementById("btn-settings");
@@ -172,6 +182,9 @@ streamPreview.addEventListener("drop", async (e) => {
   if (type.startsWith("image/")) {
     // ── Image drop: load, broadcast, and activate ──
     if (outputToggleBusy) return;
+    const dn = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+    imageFileName.textContent = dn;
+    imageFileName.style.color = "#ccc";
     outputToggleBusy = true;
     deactivateAllOutputs();
     toggleImage.classList.add("on", "busy");
@@ -222,6 +235,9 @@ streamPreview.addEventListener("drop", async (e) => {
   } else if (type.startsWith("video/")) {
     // ── Video drop: upload and activate ──
     if (outputToggleBusy) return;
+    const vdn = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+    videoFileName.textContent = vdn;
+    videoFileName.style.color = "#ccc";
     statusBar.textContent = "Uploading video...";
     try {
       const buffer = await file.arrayBuffer();
@@ -231,7 +247,7 @@ streamPreview.addEventListener("drop", async (e) => {
       if (videoFileUrl) URL.revokeObjectURL(videoFileUrl);
       videoFileUrl = URL.createObjectURL(file);
       videoUploaded = true;
-      btnPickVideo.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+      btnPickVideo.textContent = vdn;
       statusBar.textContent = `Video uploaded: ${file.name}`;
 
       // Auto-activate
@@ -255,6 +271,9 @@ streamPreview.addEventListener("drop", async (e) => {
   } else if (type.startsWith("audio/")) {
     // ── Audio/Music drop: upload and activate ──
     if (outputToggleBusy) return;
+    const mdn = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+    musicFileName.textContent = mdn;
+    musicFileName.style.color = "#ccc";
     statusBar.textContent = "Uploading music...";
     try {
       const buffer = await file.arrayBuffer();
@@ -262,7 +281,7 @@ streamPreview.addEventListener("drop", async (e) => {
       if (result.error) { statusBar.textContent = `Music upload failed: ${result.error}`; return; }
 
       musicUploaded = true;
-      btnPickMusic.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+      btnPickMusic.textContent = mdn;
       statusBar.textContent = `Music uploaded: ${file.name}`;
 
       // Auto-activate
@@ -666,17 +685,21 @@ dropZone.addEventListener("drop", (e) => {
 
 fileInput.addEventListener("change", () => {
   const file = fileInput.files?.[0];
-  if (file) loadImageFile(file);
+  if (file) loadImageFile(file, true);
   fileInput.value = "";
 });
 
-function loadImageFile(file) {
+function loadImageFile(file, autoActivate = false) {
   if (!file.type.startsWith("image/")) return;
+
+  const displayName = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+  imageFileName.textContent = displayName;
+  imageFileName.style.color = "#ccc";
 
   const reader = new FileReader();
   reader.onload = () => {
     const dataUrl = reader.result;
-    // Show preview
+    // Show preview in modal if open
     dropZone.innerHTML = `<img src="${dataUrl}" />`;
 
     // Convert to JPEG base64 via canvas
@@ -710,8 +733,30 @@ function loadImageFile(file) {
       pendingImageB64 = jpegDataUrl.split(",")[1];
       modalSend.disabled = false;
 
-      // Auto-push if image toggle is already ON
-      if (toggleImage.classList.contains("on")) {
+      // Auto-activate: broadcast immediately after picking from row click
+      if (autoActivate && !outputToggleBusy) {
+        outputToggleBusy = true;
+        deactivateAllOutputs();
+        toggleImage.classList.add("on", "busy");
+        (async () => {
+          try {
+            await bridge.deactivateOutputMedia().catch(() => {});
+            const result = await bridge.broadcastImage(pendingImageB64);
+            if (result.error) throw new Error(result.error);
+            streamImage.src = `data:image/jpeg;base64,${pendingImageB64}`;
+            showPreview("image");
+            indImage.classList.add("active");
+            statusBar.textContent = `Image sent to ${result.sent} bot(s)`;
+          } catch (err) {
+            toggleImage.classList.remove("on");
+            indImage.classList.remove("active");
+            statusBar.textContent = `Image failed: ${err.message}`;
+          } finally {
+            toggleImage.classList.remove("busy");
+            outputToggleBusy = false;
+          }
+        })();
+      } else if (toggleImage.classList.contains("on")) {
         broadcastCurrentImage();
       }
     };
@@ -777,8 +822,10 @@ const ROOM_COLORS = ["#00ff88", "#ff9f43", "#ff6b6b", "#a55eea", "#2ed573", "#ff
 
 function renderBots() {
   if (activeBots.length === 0) {
-    botGrid.innerHTML = "";
-    botGrid.appendChild(emptyState);
+    // Clear room sections but preserve the panel title
+    botGrid.querySelectorAll(".room-section").forEach((s) => s.remove());
+    botGrid.querySelectorAll(":scope > .bot-tile").forEach((t) => t.remove());
+    if (!botGrid.contains(emptyState)) botGrid.appendChild(emptyState);
     emptyState.style.display = "flex";
     return;
   }
@@ -1183,6 +1230,39 @@ async function deactivateAllOutputsAndApi() {
 
 let videoRecorder = null;
 
+// Populate video input device list
+async function populateVideoDevices() {
+  try {
+    const tempStream = await navigator.mediaDevices.getUserMedia({ video: true });
+    tempStream.getTracks().forEach((t) => t.stop());
+  } catch { /* permission denied — labels will be generic */ }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const videoInputs = devices.filter((d) => d.kind === "videoinput");
+  // Remove old camera device options (keep placeholder + Screen Capture)
+  while (cameraSource.options.length > 2) cameraSource.remove(2);
+  // Insert camera devices before Screen Capture
+  const screenOpt = cameraSource.options[1]; // "Screen Capture"
+  for (const dev of videoInputs) {
+    const opt = document.createElement("option");
+    opt.value = `cam:${dev.deviceId}`;
+    opt.textContent = dev.label || `Camera ${videoInputs.indexOf(dev) + 1}`;
+    cameraSource.insertBefore(opt, screenOpt);
+  }
+  // Restore last selected device
+  const saved = localStorage.getItem("lastCameraSource");
+  if (saved && [...cameraSource.options].some((o) => o.value === saved)) {
+    cameraSource.value = saved;
+  } else if (videoInputs.length === 1) {
+    cameraSource.selectedIndex = 1;
+  }
+}
+populateVideoDevices();
+navigator.mediaDevices.addEventListener("devicechange", populateVideoDevices);
+cameraSource.addEventListener("change", () => {
+  localStorage.setItem("lastCameraSource", cameraSource.value);
+});
+
 // Auto-switch source when dropdown changes while camera is ON
 cameraSource.addEventListener("change", async () => {
   if (outputToggleBusy) return;
@@ -1221,12 +1301,7 @@ toggleCamera.addEventListener("click", async () => {
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "Camera feed cleared";
     } else {
-      if (source === "camera") {
-        videoStream = await navigator.mediaDevices.getUserMedia({
-          video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-          audio: false,
-        });
-      } else if (source === "screen") {
+      if (source === "screen") {
         const sources = await bridge.getSources();
         if (sources.length === 0) throw new Error("No screen sources available");
         const screenSource = sources.find((s) => s.name === "Entire Screen") || sources[0];
@@ -1238,6 +1313,18 @@ toggleCamera.addEventListener("click", async () => {
               maxWidth: 1280,
               maxHeight: 720,
             },
+          },
+          audio: false,
+        });
+      } else {
+        // Camera device — extract deviceId from "cam:xxx" value
+        const deviceId = source.startsWith("cam:") ? source.slice(4) : source;
+        videoStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            deviceId: { exact: deviceId },
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            frameRate: { ideal: 30 },
           },
           audio: false,
         });
@@ -1275,7 +1362,7 @@ function startVideoRecorder() {
 
   videoRecorder = new MediaRecorder(videoStream, {
     mimeType,
-    videoBitsPerSecond: 2000000,
+    videoBitsPerSecond: 2500000,
   });
 
   videoRecorder.ondataavailable = async (e) => {
@@ -1286,7 +1373,8 @@ function startVideoRecorder() {
     if (framesSent % 10 === 0) updateStreamInfo();
   };
 
-  videoRecorder.start(200);
+  // 500ms timeslice — larger chunks = fewer keyframe boundaries = smoother playback
+  videoRecorder.start(500);
   framesSent = 0;
   console.log("[stream] MediaRecorder started:", mimeType);
   updateStreamInfo();
@@ -1467,8 +1555,59 @@ toggleUrl.addEventListener("click", async () => {
   await pushUrlToBots();
 });
 
-// Send button pushes URL (turns on toggle if off)
-btnSendUrl.addEventListener("click", () => pushUrlToBots());
+// Row click handlers — clicking the row acts as the on/off toggle
+rowCamera.addEventListener("click", (e) => {
+  // Don't trigger if clicking the select dropdown
+  if (e.target.closest("select")) return;
+  toggleCamera.click();
+});
+
+rowUrl.addEventListener("click", (e) => {
+  // Don't trigger if clicking inside the URL input
+  if (e.target.closest("input")) return;
+  // If URL is on, turn it off; otherwise send/activate
+  if (toggleUrl.classList.contains("on")) {
+    toggleUrl.click();
+  } else {
+    pushUrlToBots();
+  }
+});
+
+rowAudio.addEventListener("click", (e) => {
+  if (e.target.closest("select")) return;
+  toggleAudio.click();
+});
+
+// Image row: click to pick file or toggle on/off
+rowImage.addEventListener("click", () => {
+  if (outputToggleBusy) return;
+  if (toggleImage.classList.contains("on")) {
+    toggleImage.click(); // turn off
+  } else {
+    // Open file picker (uses the image modal)
+    fileInput.click();
+  }
+});
+
+// Video row: click to pick file or toggle on/off
+rowVideo.addEventListener("click", () => {
+  if (outputToggleBusy) return;
+  if (toggleVideo.classList.contains("on")) {
+    toggleVideo.click(); // turn off
+  } else {
+    videoFileInput.click();
+  }
+});
+
+// Music row: click to pick file or toggle on/off
+rowMusic.addEventListener("click", () => {
+  if (outputToggleBusy) return;
+  if (toggleMusic.classList.contains("on")) {
+    toggleMusic.click(); // turn off
+  } else {
+    musicFileInput.click();
+  }
+});
 
 // Enter key in URL input pushes URL
 urlInput.addEventListener("keydown", (e) => {
@@ -1484,36 +1623,40 @@ videoFileInput.addEventListener("change", async () => {
   if (!file) return;
   videoFileInput.value = "";
 
+  const displayName = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+  videoFileName.textContent = displayName;
+  videoFileName.style.color = "#ccc";
+
   // Local preview blob URL
   if (videoFileUrl) URL.revokeObjectURL(videoFileUrl);
   videoFileUrl = URL.createObjectURL(file);
 
-  // Upload to server (read as ArrayBuffer)
+  // Upload to server and auto-activate
   statusBar.textContent = "Uploading video...";
+  outputToggleBusy = true;
+  deactivateAllOutputs();
+  toggleVideo.classList.add("on", "busy");
+
   try {
     const buffer = await file.arrayBuffer();
     const result = await bridge.uploadVideo(file.name, buffer);
     if (result.error) {
+      toggleVideo.classList.remove("on");
       statusBar.textContent = `Video upload failed: ${result.error}`;
       return;
     }
     videoUploaded = true;
-    btnPickVideo.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+    btnPickVideo.textContent = displayName;
     statusBar.textContent = `Video uploaded: ${file.name}`;
 
-    // Auto-re-activate if toggle is already ON
-    if (toggleVideo.classList.contains("on") && !outputToggleBusy) {
-      outputToggleBusy = true;
-      toggleVideo.classList.add("busy");
-      try {
-        await activateVideoOutput();
-      } finally {
-        toggleVideo.classList.remove("busy");
-        outputToggleBusy = false;
-      }
-    }
+    await activateVideoOutput();
   } catch (err) {
+    toggleVideo.classList.remove("on");
+    indVideo.classList.remove("active");
     statusBar.textContent = `Video upload failed: ${err.message}`;
+  } finally {
+    toggleVideo.classList.remove("busy");
+    outputToggleBusy = false;
   }
 });
 
@@ -1600,30 +1743,35 @@ musicFileInput.addEventListener("change", async () => {
   if (!file) return;
   musicFileInput.value = "";
 
+  const displayName = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+  musicFileName.textContent = displayName;
+  musicFileName.style.color = "#ccc";
+
   statusBar.textContent = "Uploading music...";
+  outputToggleBusy = true;
+  deactivateAllOutputs();
+  toggleMusic.classList.add("on", "busy");
+
   try {
     const buffer = await file.arrayBuffer();
     const result = await bridge.uploadMusic(file.name, buffer);
     if (result.error) {
+      toggleMusic.classList.remove("on");
       statusBar.textContent = `Music upload failed: ${result.error}`;
       return;
     }
     musicUploaded = true;
-    btnPickMusic.textContent = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+    btnPickMusic.textContent = displayName;
     statusBar.textContent = `Music uploaded: ${file.name}`;
 
-    if (toggleMusic.classList.contains("on") && !outputToggleBusy) {
-      outputToggleBusy = true;
-      toggleMusic.classList.add("busy");
-      try {
-        await activateMusicOutput();
-      } finally {
-        toggleMusic.classList.remove("busy");
-        outputToggleBusy = false;
-      }
-    }
+    await activateMusicOutput();
   } catch (err) {
+    toggleMusic.classList.remove("on");
+    indMusic.classList.remove("active");
     statusBar.textContent = `Music upload failed: ${err.message}`;
+  } finally {
+    toggleMusic.classList.remove("busy");
+    outputToggleBusy = false;
   }
 });
 
@@ -1692,10 +1840,50 @@ toggleMusic.addEventListener("click", async () => {
 
 // ── Audio toggle ──────────────────────────────────────────────────────
 
+const audioSource = document.getElementById("audio-source");
+
+// Populate audio input device list
+async function populateAudioDevices() {
+  // Request permission first so labels are available
+  try {
+    const tempStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    tempStream.getTracks().forEach((t) => t.stop());
+  } catch { /* permission denied — labels will be generic */ }
+
+  const devices = await navigator.mediaDevices.enumerateDevices();
+  const audioInputs = devices.filter((d) => d.kind === "audioinput");
+  // Keep the placeholder, remove old options
+  while (audioSource.options.length > 1) audioSource.remove(1);
+  for (const dev of audioInputs) {
+    const opt = document.createElement("option");
+    opt.value = dev.deviceId;
+    opt.textContent = dev.label || `Microphone ${audioSource.options.length}`;
+    audioSource.appendChild(opt);
+  }
+  // Restore last selected device
+  const saved = localStorage.getItem("lastAudioSource");
+  if (saved && [...audioSource.options].some((o) => o.value === saved)) {
+    audioSource.value = saved;
+  } else if (audioInputs.length === 1) {
+    audioSource.selectedIndex = 1;
+  }
+}
+populateAudioDevices();
+navigator.mediaDevices.addEventListener("devicechange", populateAudioDevices);
+audioSource.addEventListener("change", () => {
+  localStorage.setItem("lastAudioSource", audioSource.value);
+});
+
 toggleAudio.addEventListener("click", async () => {
   if (outputToggleBusy) return;
 
   const turningOff = toggleAudio.classList.contains("on");
+  const deviceId = audioSource.value;
+
+  if (!turningOff && !deviceId) {
+    statusBar.textContent = "Select an audio device first";
+    return;
+  }
 
   outputToggleBusy = true;
   if (turningOff) {
@@ -1714,7 +1902,7 @@ toggleAudio.addEventListener("click", async () => {
       statusBar.textContent = "Audio feed cleared";
     } else {
       audioStream = await navigator.mediaDevices.getUserMedia({
-        audio: true,
+        audio: { deviceId: { exact: deviceId } },
         video: false,
       });
 
@@ -1731,7 +1919,7 @@ toggleAudio.addEventListener("click", async () => {
         mimeType: "audio/webm;codecs=opus",
       });
 
-      // Send raw webm chunks via WebSocket (no base64, no IPC round-trip)
+      // Continuous stream — send webm chunks to server via WebSocket
       audioRecorder.ondataavailable = async (e) => {
         if (e.data.size === 0) return;
         const buffer = await e.data.arrayBuffer();
@@ -1740,16 +1928,16 @@ toggleAudio.addEventListener("click", async () => {
         }
       };
 
-      // Start continuous recording — requestData() flushes without stopping
+      // Continuous recording — requestData() flushes without stopping
       audioRecorder.start();
       audioChunkInterval = setInterval(() => {
         if (audioRecorder && audioRecorder.state === "recording") {
-          audioRecorder.requestData(); // gapless: no stop/start cycle
+          audioRecorder.requestData();
         }
-      }, 3000);
+      }, 1000);
 
       indAudio.classList.add("active");
-      statusBar.textContent = "Audio streaming (gapless)";
+      statusBar.textContent = "Audio streaming";
       updateStreamInfo();
     }
   } catch (err) {
