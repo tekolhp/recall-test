@@ -1195,36 +1195,43 @@ function stopAudioStream() {
 // Audio is also exclusive with output_media. Turning one ON turns the others OFF.
 
 // Clean up UI + local streams only (no API call — avoids race conditions)
+function showThumbnailOrNone() {
+  if (thumbnailSet && streamImage.src && streamImage.src.includes("thumbnail")) {
+    showPreview("image");
+  } else if (thumbnailSet) {
+    streamImage.src = `http://localhost:3000/media/thumbnail/current.jpg?t=${Date.now()}`;
+    showPreview("image");
+  } else {
+    showPreview("none");
+  }
+}
+
 function deactivateAllOutputs() {
   if (toggleCamera.classList.contains("on")) {
     stopCamera();
-    showPreview("none");
   }
   if (toggleImage.classList.contains("on")) {
     toggleImage.classList.remove("on");
     indImage.classList.remove("active");
-    showPreview("none");
   }
   if (toggleVideo.classList.contains("on")) {
     toggleVideo.classList.remove("on");
     indVideo.classList.remove("active");
     streamVideo.src = "";
     streamVideo.srcObject = null;
-    showPreview("none");
   }
   if (toggleMusic.classList.contains("on")) {
     toggleMusic.classList.remove("on");
     indMusic.classList.remove("active");
-    showPreview("none");
   }
   if (toggleUrl.classList.contains("on")) {
     toggleUrl.classList.remove("on");
     indUrl.classList.remove("active");
-    showPreview("none");
   }
   if (toggleAudio.classList.contains("on")) {
     stopAudioStream();
   }
+  showThumbnailOrNone();
 }
 
 // Full cleanup: UI + DELETE output_media on Recall API
@@ -1397,7 +1404,7 @@ toggleCamera.addEventListener("click", async () => {
   try {
     if (turningOff) {
       stopCamera();
-      showPreview("none");
+      showThumbnailOrNone();
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "Camera feed cleared";
     } else {
@@ -1566,7 +1573,7 @@ toggleImage.addEventListener("click", async () => {
 
   try {
     if (turningOff) {
-      showPreview("none");
+      showThumbnailOrNone();
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "Image feed cleared";
     } else {
@@ -1661,7 +1668,7 @@ toggleUrl.addEventListener("click", async () => {
     toggleUrl.classList.add("busy");
 
     try {
-      showPreview("none");
+      showThumbnailOrNone();
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "URL feed cleared";
     } catch (err) {
@@ -1842,7 +1849,7 @@ toggleVideo.addEventListener("click", async () => {
     if (turningOff) {
       streamVideo.src = "";
       streamVideo.srcObject = null;
-      showPreview("none");
+      showThumbnailOrNone();
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "Video feed cleared";
     } else {
@@ -1952,14 +1959,14 @@ toggleMusic.addEventListener("click", async () => {
 
   try {
     if (turningOff) {
-      showPreview("none");
+      showThumbnailOrNone();
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "Music feed cleared";
     } else {
       const musicLoop = loopMusic.classList.contains("active");
       const result = await bridge.activateMusicOutput(musicLoop);
       if (result.error) throw new Error(result.error);
-      showPreview("none");
+      showThumbnailOrNone();
       indMusic.classList.add("active");
       statusBar.textContent = `Music output active on ${result.activated} bot(s)`;
     }

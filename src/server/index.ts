@@ -463,7 +463,27 @@ app.post("/api/bots/activate-youtube", express.json(), async (req, res) => {
   res.json({ ok: true, activated });
 });
 
-// Deactivate output_media on all active bots
+// Push thumbnail to all active bots (used internally after deactivation)
+async function pushThumbnailToActiveBots() {
+  if (!customThumbnailB64) return;
+  const activeBotList = Array.from(bots.values()).filter(
+    (b) => !["done", "fatal", "leaving"].includes(b.status)
+  );
+  if (activeBotList.length === 0) return;
+  const body = JSON.stringify({ kind: "jpeg", b64_data: customThumbnailB64 });
+  await Promise.allSettled(
+    activeBotList.map((bot) =>
+      fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`, {
+        method: "POST",
+        headers: { Authorization: `Token ${API_KEY}`, "Content-Type": "application/json" },
+        body,
+      })
+    )
+  );
+  console.log(`[thumbnail] Restored on ${activeBotList.length} bot(s)`);
+}
+
+// Deactivate output_media on all active bots, then restore thumbnail
 app.post("/api/bots/deactivate-output-media", async (_req, res) => {
   let deactivated = 0;
   for (const [, bot] of bots) {
@@ -480,6 +500,8 @@ app.post("/api/bots/deactivate-output-media", async (_req, res) => {
       if (response.ok) deactivated++;
     } catch {}
   }
+  // Restore thumbnail as bot's camera after clearing output_media
+  await pushThumbnailToActiveBots();
   res.json({ ok: true, deactivated });
 });
 
@@ -1010,29 +1032,11 @@ app.post("/api/thumbnail/push", async (_req, res) => {
     res.status(400).json({ error: "No thumbnail set" });
     return;
   }
-  const activeBotList = Array.from(bots.values()).filter(
+  await pushThumbnailToActiveBots();
+  const count = Array.from(bots.values()).filter(
     (b) => !["done", "fatal", "leaving"].includes(b.status)
-  );
-  if (activeBotList.length === 0) {
-    res.json({ ok: true, pushed: 0 });
-    return;
-  }
-  const body = JSON.stringify({ kind: "jpeg", b64_data: customThumbnailB64 });
-  let pushed = 0;
-  await Promise.allSettled(
-    activeBotList.map((bot) =>
-      fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`, {
-        method: "POST",
-        headers: { Authorization: `Token ${API_KEY}`, "Content-Type": "application/json" },
-        body,
-      }).then(async (r) => {
-        if (r.ok) pushed++;
-        else console.error(`[thumbnail] push to ${bot.id}: ${r.status}`);
-      })
-    )
-  );
-  console.log(`[thumbnail] Pushed to ${pushed}/${activeBotList.length} bots`);
-  res.json({ ok: true, pushed });
+  ).length;
+  res.json({ ok: true, pushed: count });
 });
 
 app.delete("/api/thumbnail", async (_req, res) => {
