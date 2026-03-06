@@ -85,6 +85,7 @@ let isSendingFrame = false;
 let outputMediaMode = false;
 let pushSocket = null; // Direct WebSocket to server for frame pushing
 let audioSocket = null; // WebSocket for gapless audio streaming
+let videoSocket = null; // WebSocket for gapless video streaming
 
 // Video file state
 let videoFileUrl = null; // blob URL for local preview
@@ -1249,18 +1250,23 @@ async function populateVideoDevices() {
     opt.textContent = dev.label || `Camera ${videoInputs.indexOf(dev) + 1}`;
     cameraSource.insertBefore(opt, screenOpt);
   }
-  // Restore last selected device
-  const saved = localStorage.getItem("lastCameraSource");
-  if (saved && [...cameraSource.options].some((o) => o.value === saved)) {
-    cameraSource.value = saved;
-  } else if (videoInputs.length === 1) {
+  // Restore last selected device by label (saved to app settings file on disk)
+  try {
+    const settings = await bridge.getAppSettings();
+    if (settings.lastCameraLabel) {
+      const match = [...cameraSource.options].find((o) => o.textContent === settings.lastCameraLabel);
+      if (match) cameraSource.value = match.value;
+    }
+  } catch {}
+  if (!cameraSource.value && videoInputs.length === 1) {
     cameraSource.selectedIndex = 1;
   }
 }
 populateVideoDevices();
 navigator.mediaDevices.addEventListener("devicechange", populateVideoDevices);
 cameraSource.addEventListener("change", () => {
-  localStorage.setItem("lastCameraSource", cameraSource.value);
+  const selectedOpt = cameraSource.options[cameraSource.selectedIndex];
+  if (selectedOpt) bridge.saveAppSettings({ lastCameraLabel: selectedOpt.textContent });
 });
 
 // Auto-switch source when dropdown changes while camera is ON
@@ -1353,8 +1359,23 @@ toggleCamera.addEventListener("click", async () => {
   }
 });
 
-function startVideoRecorder() {
+async function startVideoRecorder() {
   if (videoRecorder || !videoStream) return;
+
+  // Open WebSocket for video chunks (bypasses IPC + HTTP overhead)
+  videoSocket = new WebSocket("ws://localhost:3000/ws/video-stream");
+  videoSocket.binaryType = "arraybuffer";
+  try {
+    await new Promise((resolve, reject) => {
+      videoSocket.onopen = resolve;
+      videoSocket.onerror = () => reject(new Error("Video WebSocket failed"));
+      setTimeout(() => reject(new Error("Video WebSocket timeout")), 5000);
+    });
+  } catch (err) {
+    console.error("[stream] Video WebSocket connection failed:", err);
+    videoSocket = null;
+    return;
+  }
 
   const mimeType = MediaRecorder.isTypeSupported("video/webm;codecs=vp8")
     ? "video/webm;codecs=vp8"
@@ -1368,15 +1389,17 @@ function startVideoRecorder() {
   videoRecorder.ondataavailable = async (e) => {
     if (e.data.size === 0) return;
     const buffer = await e.data.arrayBuffer();
-    bridge.streamWebmChunk(buffer);
+    if (videoSocket && videoSocket.readyState === WebSocket.OPEN) {
+      videoSocket.send(buffer);
+    }
     framesSent++;
     if (framesSent % 10 === 0) updateStreamInfo();
   };
 
-  // 500ms timeslice — larger chunks = fewer keyframe boundaries = smoother playback
+  // 500ms timeslice
   videoRecorder.start(500);
   framesSent = 0;
-  console.log("[stream] MediaRecorder started:", mimeType);
+  console.log("[stream] MediaRecorder started (WebSocket):", mimeType);
   updateStreamInfo();
 }
 
@@ -1384,6 +1407,10 @@ function stopVideoRecorder() {
   if (videoRecorder) {
     videoRecorder.stop();
     videoRecorder = null;
+  }
+  if (videoSocket) {
+    videoSocket.close();
+    videoSocket = null;
   }
   updateStreamInfo();
 }
@@ -1397,7 +1424,7 @@ function updateStreamInfo() {
 
   let fpsDisplay;
   if (outputMediaMode) {
-    fpsDisplay = videoActive ? "~30" : "0";
+    fpsDisplay = videoActive ? "~15" : "0";
   } else {
     fpsDisplay = activeBotCount > 0 ? (5 / activeBotCount).toFixed(1) : "0";
   }
@@ -1860,18 +1887,23 @@ async function populateAudioDevices() {
     opt.textContent = dev.label || `Microphone ${audioSource.options.length}`;
     audioSource.appendChild(opt);
   }
-  // Restore last selected device
-  const saved = localStorage.getItem("lastAudioSource");
-  if (saved && [...audioSource.options].some((o) => o.value === saved)) {
-    audioSource.value = saved;
-  } else if (audioInputs.length === 1) {
+  // Restore last selected device by label (saved to app settings file on disk)
+  try {
+    const settings = await bridge.getAppSettings();
+    if (settings.lastAudioLabel) {
+      const match = [...audioSource.options].find((o) => o.textContent === settings.lastAudioLabel);
+      if (match) audioSource.value = match.value;
+    }
+  } catch {}
+  if (!audioSource.value && audioInputs.length === 1) {
     audioSource.selectedIndex = 1;
   }
 }
 populateAudioDevices();
 navigator.mediaDevices.addEventListener("devicechange", populateAudioDevices);
 audioSource.addEventListener("change", () => {
-  localStorage.setItem("lastAudioSource", audioSource.value);
+  const selectedOpt = audioSource.options[audioSource.selectedIndex];
+  if (selectedOpt) bridge.saveAppSettings({ lastAudioLabel: selectedOpt.textContent });
 });
 
 toggleAudio.addEventListener("click", async () => {

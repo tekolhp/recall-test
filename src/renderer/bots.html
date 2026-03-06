@@ -402,6 +402,7 @@
       align-items: center;
       gap: 10px;
       padding: 6px 10px;
+      min-height: 36px;
       background: #151515;
       border-radius: 6px;
       border: 1px solid #222;
@@ -689,12 +690,6 @@
           <div class="feature-toggle" id="toggle-camera"></div>
           <div class="feature-indicator" id="ind-camera"></div>
         </div>
-        <div class="feature-row" id="row-url">
-          <span class="feature-label">URL</span>
-          <input type="text" class="feature-url-input" id="url-input" placeholder="https://example.com/page" />
-          <div class="feature-toggle" id="toggle-url"></div>
-          <div class="feature-indicator" id="ind-url"></div>
-        </div>
         <div class="feature-row" id="row-audio">
           <span class="feature-label">Audio</span>
           <select id="audio-source">
@@ -720,6 +715,12 @@
           <span class="feature-file-name" id="music-file-name" style="flex:1;font-size:12px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Upload</span>
           <div class="feature-toggle" id="toggle-music"></div>
           <div class="feature-indicator" id="ind-music"></div>
+        </div>
+        <div class="feature-row" id="row-url">
+          <span class="feature-label">URL</span>
+          <input type="text" class="feature-url-input" id="url-input" placeholder="https://example.com/page" />
+          <div class="feature-toggle" id="toggle-url"></div>
+          <div class="feature-indicator" id="ind-url"></div>
         </div>
         <div class="stream-info" id="stream-info">
           Video: stopped | Audio: stopped | Rate: <span class="rate">0 fps</span>

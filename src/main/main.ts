@@ -79,6 +79,8 @@ const APP_SETTINGS_PATH = path.join(app.getPath("userData"), "app-settings.json"
 
 interface AppSettings {
   transcriptionProvider: "recallai" | "deepgram";
+  lastCameraLabel?: string;
+  lastAudioLabel?: string;
 }
 
 function loadAppSettings(): AppSettings {
@@ -90,8 +92,11 @@ function loadAppSettings(): AppSettings {
   return { transcriptionProvider: "recallai" };
 }
 
-function saveAppSettings(settings: AppSettings): void {
-  fs.writeFileSync(APP_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+function saveAppSettings(settings: Partial<AppSettings>): void {
+  // Merge with existing to preserve fields not included in the update
+  const current = loadAppSettings();
+  const merged = { ...current, ...settings };
+  fs.writeFileSync(APP_SETTINGS_PATH, JSON.stringify(merged, null, 2));
 }
 
 let appSettings = loadAppSettings();

@@ -494,6 +494,30 @@ wssPush.on("connection", (ws) => {
   });
 });
 
+// ── WebSocket for gapless video streaming (renderer → ffmpeg HLS) ──────────
+const wssVideoStream = new WebSocketServer({ noServer: true });
+
+wssVideoStream.on("connection", (ws) => {
+  console.log("[ws-video] Video stream client connected");
+  if (!ffmpegProc) startFfmpegHls();
+
+  ws.on("message", (data: Buffer) => {
+    try {
+      if (ffmpegProc?.stdin?.writable) {
+        ffmpegProc.stdin.write(data);
+      }
+    } catch {}
+  });
+
+  ws.on("close", () => {
+    console.log("[ws-video] Video stream client disconnected");
+  });
+
+  ws.on("error", (err) => {
+    console.error("[ws-video] WebSocket error:", err);
+  });
+});
+
 // ── WebSocket for gapless audio streaming (mic → ffmpeg → MP3 → Recall API) ──
 const wssAudio = new WebSocketServer({ noServer: true });
 
@@ -775,9 +799,12 @@ const hlsUrl = '/hls/webcam/index.m3u8';
 function startHls() {
   if (typeof Hls !== 'undefined' && Hls.isSupported()) {
     const hls = new Hls({
+      lowLatencyMode: true,
       liveSyncDurationCount: 1,
       liveMaxLatencyDurationCount: 2,
-      maxBufferLength: 2,
+      maxBufferLength: 1,
+      maxMaxBufferLength: 2,
+      backBufferLength: 0,
       enableWorker: true,
     });
     hls.loadSource(hlsUrl);
@@ -785,7 +812,11 @@ function startHls() {
     hls.on(Hls.Events.MANIFEST_PARSED, () => video.play());
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (data.fatal) {
-        setTimeout(() => { hls.destroy(); startHls(); }, 2000);
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          hls.recoverMediaError();
+        } else {
+          setTimeout(() => { hls.destroy(); startHls(); }, 1000);
+        }
       }
     });
   } else {
@@ -958,23 +989,33 @@ function startFfmpegHls() {
   }
 
   ffmpegProc = spawn("/opt/homebrew/bin/ffmpeg", [
+    // Input: minimize buffering & startup delay
+    "-fflags", "+nobuffer+flush_packets",
+    "-flags", "+low_delay",
+    "-probesize", "32",
+    "-analyzeduration", "0",
     "-f", "webm",
-    "-i", "pipe:0",           // Read webm from stdin
+    "-i", "pipe:0",
+    // Discard audio (video-only stream)
+    "-an",
+    // Video encoding
     "-c:v", "libx264",
     "-preset", "ultrafast",
     "-tune", "zerolatency",
-    "-g", "30",               // Keyframe every 30 frames
+    "-g", "15",               // Keyframe every 1s at 15fps
     "-sc_threshold", "0",
     "-b:v", "1500k",
     "-maxrate", "1500k",
-    "-bufsize", "3000k",
+    "-bufsize", "1500k",      // 1x bitrate for consistent output
     "-s", "1280x720",
-    "-r", "30",
+    "-r", "15",               // Bot browser renders at 15fps max (Recall docs)
+    // Output: HLS with immediate flush
     "-f", "hls",
-    "-hls_time", "1",         // 1-second segments
+    "-hls_time", "1",
     "-hls_list_size", "3",
     "-hls_flags", "delete_segments+append_list",
     "-hls_segment_filename", path.join(HLS_DIR, "seg%03d.ts"),
+    "-flush_packets", "1",
     path.join(HLS_DIR, "index.m3u8"),
   ], { stdio: ["pipe", "pipe", "pipe"] });
 
@@ -988,7 +1029,7 @@ function startFfmpegHls() {
     ffmpegProc = null;
   });
 
-  console.log("[ffmpeg] HLS encoder started (1s segments, 1280x720, 30fps)");
+  console.log("[ffmpeg] HLS encoder started (1s segments, 1280x720, 15fps)");
 }
 
 function stopFfmpegHls() {
@@ -2190,6 +2231,8 @@ server.on("upgrade", (req, socket, head) => {
     wssTranscript.handleUpgrade(req, socket, head, (ws) => wssTranscript.emit("connection", ws, req));
   } else if (pathname === "/ws/recall-transcript") {
     wssRecallTranscript.handleUpgrade(req, socket, head, (ws) => wssRecallTranscript.emit("connection", ws, req));
+  } else if (pathname === "/ws/video-stream") {
+    wssVideoStream.handleUpgrade(req, socket, head, (ws) => wssVideoStream.emit("connection", ws, req));
   } else {
     socket.destroy();
   }
