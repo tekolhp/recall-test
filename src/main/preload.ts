@@ -64,6 +64,7 @@ contextBridge.exposeInMainWorld("recallBridge", {
     ipcRenderer.invoke("broadcast-audio-webm", b64Data),
   getBotTranscript: (botId: string) =>
     ipcRenderer.invoke("get-bot-transcript", botId),
+  resetSession: () => ipcRenderer.invoke("reset-session"),
 
   // ── Output Media (30fps webpage mode) ──────────────────────────────
   startOutputMedia: (botId: string, url: string) =>
@@ -88,4 +89,6 @@ contextBridge.exposeInMainWorld("recallBridge", {
     ipcRenderer.invoke("activate-youtube", videoId),
   pushOutputMediaFrame: (b64Data: string) =>
     ipcRenderer.invoke("push-output-media-frame", b64Data),
+  openExternal: (url: string) =>
+    ipcRenderer.invoke("open-external", url),
 });

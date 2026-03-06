@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, systemPreferences, dialog, desktopCapturer } from "electron";
+import { app, BrowserWindow, ipcMain, systemPreferences, dialog, desktopCapturer, shell } from "electron";
 import { exec, spawn, ChildProcess } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
@@ -422,6 +422,15 @@ app.whenReady().then(async () => {
     }
   });
 
+  ipcMain.handle("reset-session", async () => {
+    try {
+      const res = await fetch(`${BACKEND_URL}/api/session/reset`, { method: "POST" });
+      return await res.json();
+    } catch (err: any) {
+      return { error: err.message };
+    }
+  });
+
   ipcMain.handle("send-image-to-bot", async (_event, botId: string, b64Data: string) => {
     if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
     try {
@@ -652,6 +661,10 @@ app.whenReady().then(async () => {
     } catch (err: any) {
       return { tunnelUrl: null, webhookUrl: null };
     }
+  });
+
+  ipcMain.handle("open-external", async (_e, url: string) => {
+    await shell.openExternal(url);
   });
 
   ipcMain.handle("get-ngrok-status", async () => {

@@ -12,7 +12,11 @@
       background: #0a0a0a;
       font-family: -apple-system, BlinkMacSystemFont, sans-serif;
       color: #eee;
-      overflow-y: auto;
+      overflow: hidden;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
     }
     nav {
       display: flex;
@@ -150,11 +154,31 @@
       border-bottom: 1px solid #1a1a1a;
     }
 
+    /* ── 3-column layout ─────────────────────── */
+    .main-columns {
+      display: flex;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
+    }
+
     .bot-grid {
       display: flex;
       flex-direction: column;
       gap: 4px;
-      padding: 8px 16px;
+      padding: 8px 12px;
+      flex: 1;
+      min-width: 0;
+      overflow-y: auto;
+    }
+
+    .right-panel {
+      width: 280px;
+      flex-shrink: 0;
+      background: #0d0d0d;
+      border-left: 1px solid #1a1a1a;
+      overflow-y: auto;
+      padding: 8px 12px;
     }
     .bot-tile {
       display: flex;
@@ -323,19 +347,21 @@
     .modal-actions .btn-send-modal { background: #4f8eff; color: #fff; }
     .modal-actions .btn-send-modal:disabled { opacity: 0.4; }
 
-    /* ── Stream panel ───────────────────────────── */
+    /* ── Stream panel (left column) ──────────────── */
     .stream-panel {
       display: flex;
       flex-direction: column;
-      padding: 12px 16px;
+      padding: 10px;
       background: #0d0d0d;
-      border-bottom: 1px solid #1a1a1a;
-      gap: 10px;
-      align-items: center;
+      border-right: 1px solid #1a1a1a;
+      gap: 8px;
+      align-items: stretch;
+      width: 280px;
+      flex-shrink: 0;
+      overflow-y: auto;
     }
     .stream-preview {
       width: 100%;
-      max-width: 480px;
       aspect-ratio: 16/9;
       background: #000;
       border-radius: 6px;
@@ -370,7 +396,6 @@
       flex-direction: column;
       gap: 6px;
       width: 100%;
-      max-width: 480px;
     }
     .feature-row {
       display: flex;
@@ -600,67 +625,75 @@
       <option value="9">9</option>
       <option value="10">10</option>
     </select>
-    <button class="btn-deploy" id="btn-deploy">Deploy Bots</button>
+    <button class="btn-deploy" id="btn-deploy">Add Bots</button>
     <button class="btn-remove-all" id="btn-remove-all" disabled>Remove All</button>
     <button class="btn-remove-all" id="btn-force-remove" style="background:#991111;">Force Kill All Bots</button>
+    <button class="btn-remove-all" id="btn-new-session" style="background:#333;">New Session</button>
   </div>
 
   <div class="status-bar" id="status-bar">No bots deployed</div>
 
-  <!-- Real-time streaming panel -->
-  <div class="stream-panel" id="stream-panel">
-    <div class="stream-preview">
-      <video id="stream-video" muted autoplay playsinline></video>
-      <img id="stream-image" />
-      <canvas id="stream-canvas" width="1280" height="720"></canvas>
-      <span class="preview-placeholder" id="preview-placeholder">Drop image, video, or audio here</span>
+  <div class="main-columns">
+    <!-- Left: Stream panel -->
+    <div class="stream-panel" id="stream-panel">
+      <div class="stream-preview">
+        <video id="stream-video" muted autoplay playsinline></video>
+        <img id="stream-image" />
+        <canvas id="stream-canvas" width="1280" height="720"></canvas>
+        <span class="preview-placeholder" id="preview-placeholder">Drop image, video, or audio here</span>
+      </div>
+      <div class="output-features">
+        <div class="feature-row">
+          <span class="feature-label">Camera</span>
+          <select id="camera-source">
+            <option value="">-- Source --</option>
+            <option value="camera">Webcam</option>
+            <option value="screen">Screen</option>
+          </select>
+          <div class="feature-toggle" id="toggle-camera"></div>
+          <div class="feature-indicator" id="ind-camera"></div>
+        </div>
+        <div class="feature-row">
+          <span class="feature-label">URL</span>
+          <input type="text" class="feature-url-input" id="url-input" placeholder="https://example.com/page" />
+          <button class="feature-btn" id="btn-send-url" style="flex:none;width:auto;padding:5px 10px;">Send</button>
+          <div class="feature-toggle" id="toggle-url"></div>
+          <div class="feature-indicator" id="ind-url"></div>
+        </div>
+        <div class="feature-row">
+          <span class="feature-label">Audio</span>
+          <button class="feature-btn" id="btn-audio-cfg" disabled>Microphone</button>
+          <div class="feature-toggle" id="toggle-audio"></div>
+          <div class="feature-indicator" id="ind-audio"></div>
+        </div>
+        <div class="stream-info" id="stream-info">
+          Video: stopped | Audio: stopped | Rate: <span class="rate">0 fps</span>
+        </div>
+      </div>
+      <!-- Hidden elements for drag-drop features (Image/Video/Music still functional) -->
+      <div style="display:none">
+        <button id="btn-pick-image">Choose File</button>
+        <div class="feature-toggle" id="toggle-image"></div>
+        <div class="feature-indicator" id="ind-image"></div>
+        <button id="btn-pick-video">Choose File</button>
+        <div class="feature-toggle" id="toggle-video"></div>
+        <div class="feature-indicator" id="ind-video"></div>
+        <button id="btn-pick-music">Choose File</button>
+        <div class="feature-toggle" id="toggle-music"></div>
+        <div class="feature-indicator" id="ind-music"></div>
+      </div>
     </div>
-    <div class="output-features">
-      <div class="feature-row">
-        <span class="feature-label">Camera</span>
-        <select id="camera-source">
-          <option value="">-- Source --</option>
-          <option value="camera">Webcam</option>
-          <option value="screen">Screen</option>
-        </select>
-        <div class="feature-toggle" id="toggle-camera"></div>
-        <div class="feature-indicator" id="ind-camera"></div>
-      </div>
-      <div class="feature-row">
-        <span class="feature-label">URL</span>
-        <input type="text" class="feature-url-input" id="url-input" placeholder="https://example.com/page" />
-        <button class="feature-btn" id="btn-send-url" style="flex:none;width:auto;padding:5px 10px;">Send</button>
-        <div class="feature-toggle" id="toggle-url"></div>
-        <div class="feature-indicator" id="ind-url"></div>
-      </div>
-      <div class="feature-row">
-        <span class="feature-label">Audio</span>
-        <button class="feature-btn" id="btn-audio-cfg" disabled>Microphone</button>
-        <div class="feature-toggle" id="toggle-audio"></div>
-        <div class="feature-indicator" id="ind-audio"></div>
-      </div>
-      <div class="stream-info" id="stream-info">
-        Video: stopped | Audio: stopped | Rate: <span class="rate">0 fps</span>
-      </div>
-    </div>
-    <!-- Hidden elements for drag-drop features (Image/Video/Music still functional) -->
-    <div style="display:none">
-      <button id="btn-pick-image">Choose File</button>
-      <div class="feature-toggle" id="toggle-image"></div>
-      <div class="feature-indicator" id="ind-image"></div>
-      <button id="btn-pick-video">Choose File</button>
-      <div class="feature-toggle" id="toggle-video"></div>
-      <div class="feature-indicator" id="ind-video"></div>
-      <button id="btn-pick-music">Choose File</button>
-      <div class="feature-toggle" id="toggle-music"></div>
-      <div class="feature-indicator" id="ind-music"></div>
-    </div>
-  </div>
 
-  <div class="bot-grid" id="bot-grid">
-    <div class="empty-state" id="empty-state">
-      <p>No bots deployed yet</p>
-      <small>Enter a Zoom meeting URL and click Deploy Bots</small>
+    <!-- Center: Bot grid / breakout rooms -->
+    <div class="bot-grid" id="bot-grid">
+      <div class="empty-state" id="empty-state">
+        <p>No bots deployed yet</p>
+        <small>Enter a Zoom meeting URL and click Deploy Bots</small>
+      </div>
+    </div>
+
+    <!-- Right: Third panel -->
+    <div class="right-panel" id="right-panel">
     </div>
   </div>
 
@@ -697,6 +730,20 @@
         Make sure your Deepgram API key is configured in the
         <strong>Recall.ai dashboard</strong> under Integrations &gt; Deepgram.
       </p>
+      <div class="settings-field">
+        <label>Breakout Room Webhook</label>
+        <p class="settings-description" style="margin-bottom:8px;font-size:11px;color:#888;">
+          To get real breakout room names, add this URL as a webhook in the
+          <strong>Recall.ai dashboard</strong> → Webhooks → Add Endpoint.
+          Subscribe to <code>bot.breakout_room_entered</code> and <code>bot.breakout_room_left</code>.
+        </p>
+        <div style="display:flex;gap:6px;">
+          <input type="text" id="webhook-url-display" readonly
+            style="flex:1;background:#1a1a1a;border:1px solid #333;color:#aaa;padding:6px 8px;border-radius:4px;font-size:11px;font-family:monospace;" />
+          <button id="btn-copy-webhook" style="padding:6px 12px;background:#333;border:1px solid #444;color:#ccc;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap;">Copy URL</button>
+          <button id="btn-open-dashboard" style="padding:6px 12px;background:#4f8eff;border:none;color:#fff;border-radius:4px;cursor:pointer;font-size:11px;white-space:nowrap;">Open Dashboard</button>
+        </div>
+      </div>
       <div class="modal-actions">
         <button class="btn-cancel" id="settings-cancel">Cancel</button>
         <button class="btn-send-modal" id="settings-save">Save</button>

@@ -43,6 +43,7 @@ interface BotRecord {
   activeParticipants: Map<string, string>;
   /** Whether this bot has received at least one participant event */
   hasReceivedParticipantEvents: boolean;
+  transcriptLines: { speaker: string; text: string }[];
 }
 
 const bots = new Map<string, BotRecord>();
@@ -70,19 +71,19 @@ async function loadBotState(): Promise<boolean> {
     if (state.botCounter) botCounter = state.botCounter;
     if (Array.isArray(state.bots)) {
       for (const b of state.bots) {
-        if (!["done", "fatal", "media_expired", "call_ended"].includes(b.status)) {
-          // Handle both old format (array of IDs) and new format (object of id→name)
-          if (Array.isArray(b.activeParticipants)) {
-            b.activeParticipants = new Map(b.activeParticipants.map((p: any) =>
-              typeof p === "object" ? [String(p.id), p.name] : [String(p), "Unknown"]
-            ));
-          } else {
-            b.activeParticipants = new Map(Object.entries(b.activeParticipants || {}));
-          }
-          b.hasReceivedParticipantEvents = b.hasReceivedParticipantEvents || false;
-          bots.set(b.id, b);
-          if (b.recallBotId) recallToLocal.set(b.recallBotId, b.id);
+        // Load ALL bots regardless of status so room state and transcripts persist
+        // Handle both old format (array of IDs) and new format (object of id→name)
+        if (Array.isArray(b.activeParticipants)) {
+          b.activeParticipants = new Map(b.activeParticipants.map((p: any) =>
+            typeof p === "object" ? [String(p.id), p.name] : [String(p), "Unknown"]
+          ));
+        } else {
+          b.activeParticipants = new Map(Object.entries(b.activeParticipants || {}));
         }
+        b.hasReceivedParticipantEvents = b.hasReceivedParticipantEvents || false;
+        b.transcriptLines = b.transcriptLines || [];
+        bots.set(b.id, b);
+        if (b.recallBotId) recallToLocal.set(b.recallBotId, b.id);
       }
     }
     if (bots.size > 0) {
@@ -216,7 +217,7 @@ async function recoverBots() {
           recallBotId: bot.id,
           name: bot.bot_name || "Recovered Bot",
           status: normalizedStatus,
-          breakoutRoom: normalizedStatus === "in_breakout_room" ? "Breakout Room" : null,
+          breakoutRoom: normalizedStatus === "in_breakout_room" ? "Breakout Room" : null, // placeholder until webhook provides real name
           meetingUrl: bot.meeting_url || "",
           createdAt: bot.created_at || new Date().toISOString(),
           meetingParticipants: (bot.meeting_participants || []).map((p: any) => ({
@@ -225,6 +226,7 @@ async function recoverBots() {
           })),
           activeParticipants: new Map(),
           hasReceivedParticipantEvents: false,
+          transcriptLines: [],
         });
         recallToLocal.set(bot.id, localId);
         recovered++;
@@ -635,6 +637,13 @@ wssRecallTranscript.on("connection", (ws, req) => {
           text,
           is_final: isFinal,
         });
+        if (isFinal && localBotId) {
+          const bot = bots.get(localBotId);
+          if (bot) {
+            bot.transcriptLines.push({ speaker, text });
+            saveBotState();
+          }
+        }
       }
     } catch (err) {
       console.error("[recall-ws] Parse error:", err);
@@ -676,6 +685,13 @@ app.post("/webhook/transcription", express.json(), (req, res) => {
       text,
       is_final: isFinal,
     });
+    if (isFinal && localBotId) {
+      const bot = bots.get(localBotId);
+      if (bot) {
+        bot.transcriptLines.push({ speaker, text });
+        saveBotState();
+      }
+    }
   }
 
   res.sendStatus(200);
@@ -1202,11 +1218,12 @@ function detectBreakoutRooms() {
     // Multiple rooms detected
     console.log(`[rooms] Detected ${rooms.length} rooms from bot visibility`);
     for (let i = 0; i < rooms.length; i++) {
-      const roomName = `Room ${i + 1}`;
+      const fallbackName = `Room ${i + 1}`;
       for (const bot of rooms[i]) {
-        if (bot.breakoutRoom !== roomName) {
-          bot.breakoutRoom = roomName;
-          console.log(`[rooms] ${bot.name} → ${roomName}`);
+        // Only assign a generic name if the bot doesn't already have a real room name from webhook
+        if (!bot.breakoutRoom) {
+          bot.breakoutRoom = fallbackName;
+          console.log(`[rooms] ${bot.name} → ${fallbackName}`);
         }
       }
     }
@@ -1272,7 +1289,8 @@ app.post("/webhooks/recall", async (req, res) => {
   }
 
   if (event === "bot.breakout_room_entered") {
-    const roomName = data?.data?.breakout_room?.name || data?.breakout_room?.name || "Unknown Room";
+    console.log(`[webhook] FULL breakout_room_entered payload: ${JSON.stringify(req.body, null, 2)}`);
+    const roomName = data?.data?.breakout_room?.name || data?.breakout_room?.name || data?.data?.name || "Unknown Room";
     console.log(
       `[webhook] Bot ${recallBotId} entered breakout room: ${roomName}`
     );
@@ -1290,8 +1308,11 @@ app.post("/webhooks/recall", async (req, res) => {
     console.log(`[webhook] Bot ${recallBotId} left breakout room: ${roomName}`);
     for (const bot of bots.values()) {
       if (bot.recallBotId === recallBotId) {
-        bot.breakoutRoom = null;
-        bot.status = "in_call_recording";
+        // Only clear breakoutRoom if bot is still active — done bots keep their room
+        if (!["done", "fatal", "leaving", "call_ended"].includes(bot.status)) {
+          bot.breakoutRoom = null;
+          bot.status = "in_call_recording";
+        }
         break;
       }
     }
@@ -1340,18 +1361,8 @@ app.post("/api/bots/deploy", async (req, res) => {
   // Re-detect all tunnels before deploying
   await detectTunnels();
 
-  // Remove any existing bots from calls before deploying new ones
-  for (const bot of bots.values()) {
-    if (!["done", "fatal", "leaving"].includes(bot.status)) {
-      try {
-        await fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/leave_call/`, {
-          method: "POST", headers: { Authorization: `Token ${API_KEY}` },
-        });
-      } catch {}
-    }
-  }
-  bots.clear();
-  botCounter = 0;
+  // Additive deploy: keep existing bots, just append new ones.
+  // botCounter keeps incrementing so IDs don't collide.
 
   const count = Math.min(Math.max(1, bot_count), 10);
   const created: BotRecord[] = [];
@@ -1369,7 +1380,7 @@ app.post("/api/bots/deploy", async (req, res) => {
 
     const botPayload: any = {
       meeting_url,
-      bot_name: `${bot_name_prefix} ${i}`,
+      bot_name: `${bot_name_prefix} ${botCounter}`,
       recording_config: {
         transcript: {
           provider: transcriptProvider,
@@ -1405,6 +1416,7 @@ app.post("/api/bots/deploy", async (req, res) => {
         url: participantUrl,
         events: ["participant_events.join", "participant_events.leave"],
       });
+
     }
 
     // RTMP streaming: receive live 720p/30fps video from the meeting
@@ -1463,7 +1475,7 @@ app.post("/api/bots/deploy", async (req, res) => {
       const record: BotRecord = {
         id: localId,
         recallBotId: data.id,
-        name: `${bot_name_prefix} ${i}`,
+        name: `${bot_name_prefix} ${botCounter}`,
         status: "joining_call",
         breakoutRoom: null,
         meetingUrl: meeting_url,
@@ -1471,6 +1483,7 @@ app.post("/api/bots/deploy", async (req, res) => {
         meetingParticipants: [],
         activeParticipants: new Map(),
         hasReceivedParticipantEvents: false,
+        transcriptLines: [],
       };
 
       bots.set(localId, record);
@@ -1511,12 +1524,9 @@ app.get("/api/bots", async (_req, res) => {
           const newStatus = latest.code?.replace("bot.", "") || bot.status;
           bot.status = newStatus;
 
-          // Sync breakout room state from polling
-          if (newStatus === "in_breakout_room" && !bot.breakoutRoom) {
-            bot.breakoutRoom = "Breakout Room";
-          } else if (newStatus !== "in_breakout_room" && bot.breakoutRoom) {
-            bot.breakoutRoom = null;
-          }
+          // Note: breakoutRoom is managed by detectBreakoutRooms() and webhooks.
+          // Don't clear it here — the Recall API often reports "in_call_recording"
+          // even when the bot is in a breakout room.
         }
         if (Array.isArray(data.meeting_participants)) {
           bot.meetingParticipants = data.meeting_participants.map((p: any) => ({
@@ -1670,9 +1680,8 @@ app.post("/api/bots/remove-all", async (_req, res) => {
     }
   }
 
-  // Clear local state so new deploys start fresh
-  bots.clear();
-  botCounter = 0;
+  // Mark leaving bots — they'll transition to "done" naturally via polling
+  // Bots stay in the map so transcripts and room state persist
   saveBotState();
 
   res.json({ results });
@@ -1731,6 +1740,29 @@ app.post("/api/bots/force-remove-all", async (_req, res) => {
   }
 
   res.json({ removed, errors, total: removed.length });
+});
+
+// ── Session reset ────────────────────────────────────────────────────
+
+app.post("/api/session/reset", async (_req, res) => {
+  // Leave any still-active bots
+  for (const bot of bots.values()) {
+    if (!["done", "fatal", "leaving"].includes(bot.status)) {
+      try {
+        await fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/leave_call/`, {
+          method: "POST",
+          headers: { Authorization: `Token ${API_KEY}` },
+        });
+      } catch {}
+    }
+  }
+
+  bots.clear();
+  recallToLocal.clear();
+  botCounter = 0;
+  saveBotState();
+
+  res.json({ ok: true });
 });
 
 // ── Bot image/audio endpoints ────────────────────────────────────────
@@ -2207,6 +2239,9 @@ server.listen(PORT, async () => {
     .then((url) => {
       smeeUrl = url;
       console.log(`[smee] ⚡ Webhook URL (paste in Recall dashboard): ${url}`);
+      console.log(`[smee] ⚠️  To get real breakout room names, add this URL as a webhook endpoint in:`);
+      console.log(`[smee]    https://dashboard.recall.ai → Webhooks → Add Endpoint → ${url}`);
+      console.log(`[smee]    Subscribe to: bot.breakout_room_entered, bot.breakout_room_left`);
       connectSmeeRelay(url);
     })
     .catch((err) => {

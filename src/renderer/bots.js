@@ -513,7 +513,7 @@ btnDeploy.addEventListener("click", async () => {
   const namePrefix = namePrefixInput.value.trim() || "Assistant";
 
   btnDeploy.disabled = true;
-  btnDeploy.textContent = "Deploying...";
+  btnDeploy.textContent = "Adding...";
   statusBar.textContent = `Deploying ${botCount} bot(s)...`;
 
   try {
@@ -524,14 +524,19 @@ btnDeploy.addEventListener("click", async () => {
       return;
     }
 
-    activeBots = result.created || [];
+    const newBots = result.created || [];
+    // Merge new bots into existing list (additive deploy)
+    const existingIds = new Set(activeBots.map((b) => b.id));
+    for (const bot of newBots) {
+      if (!existingIds.has(bot.id)) activeBots.push(bot);
+    }
     outputMediaMode = result.mode === "webpage";
     const modeLabel = outputMediaMode ? "Webpage 30fps" : "API 5fps";
-    if (result.errors?.length && activeBots.length === 0) {
+    if (result.errors?.length && newBots.length === 0) {
       statusBar.textContent = `Deploy failed: ${result.errors[0].error}`;
     } else {
       statusBar.textContent =
-        `Deployed ${activeBots.length} bot(s) [${modeLabel}]` +
+        `Added ${newBots.length} bot(s) [${modeLabel}], ${activeBots.length} total` +
         (result.errors?.length ? ` (${result.errors.length} failed: ${result.errors[0].error})` : "");
     }
 
@@ -543,7 +548,7 @@ btnDeploy.addEventListener("click", async () => {
     statusBar.textContent = `Deploy failed: ${err.message}`;
   } finally {
     btnDeploy.disabled = false;
-    btnDeploy.textContent = "Deploy Bots";
+    btnDeploy.textContent = "Add Bots";
   }
 });
 
@@ -555,12 +560,16 @@ btnRemoveAll.addEventListener("click", async () => {
   try {
     await deactivateAllOutputsAndApi();
     await bridge.removeAllBots();
-    stopPolling();
-    activeBots = [];
-    renderBots();
+    // Re-fetch bots from server — they persist with transcripts, just marked as leaving/done
+    const bots = await bridge.listBots();
+    if (Array.isArray(bots)) {
+      activeBots = bots;
+      renderBots();
+    }
+    // Keep polling so bots transition from "leaving" → "done" in the UI
+    // Polling will show updated status dots
 
-    statusBar.textContent = "All bots removed";
-    btnRemoveAll.disabled = true;
+    statusBar.textContent = "All bots told to leave — transcripts preserved";
   } catch (err) {
     statusBar.textContent = `Remove failed: ${err.message}`;
   } finally {
@@ -591,6 +600,27 @@ btnForceRemove.addEventListener("click", async () => {
   } finally {
     btnForceRemove.disabled = false;
     btnForceRemove.textContent = "Force Kill All Bots";
+  }
+});
+
+// ── New Session ───────────────────────────────────────────────────────
+const btnNewSession = document.getElementById("btn-new-session");
+btnNewSession.addEventListener("click", async () => {
+  if (!confirm("Start a new session? This will remove all bots and clear all state.")) return;
+  btnNewSession.disabled = true;
+  statusBar.textContent = "Resetting session...";
+
+  try {
+    await bridge.resetSession();
+    stopPolling();
+    activeBots = [];
+    renderBots();
+    statusBar.textContent = "New session started";
+    btnRemoveAll.disabled = true;
+  } catch (err) {
+    statusBar.textContent = `Session reset failed: ${err.message}`;
+  } finally {
+    btnNewSession.disabled = false;
   }
 });
 
@@ -859,12 +889,29 @@ function createBotTile(bot) {
 
   const isActive = !["done", "fatal", "leaving"].includes(bot.status);
 
+  // Build stored transcript HTML from server-persisted lines
+  let storedTranscriptHtml = "";
+  if (bot.transcriptLines && bot.transcriptLines.length > 0) {
+    storedTranscriptHtml = bot.transcriptLines.map((line) => {
+      if (line.speaker) {
+        const color = speakerColor(line.speaker);
+        const initials = escapeHtml(speakerInitials(line.speaker));
+        return `<div class="transcript-line"><span class="speaker-avatar" style="background:${color}">${initials}</span><span class="transcript-line-text"><span class="speaker">${escapeHtml(line.speaker)}:</span> ${escapeHtml(line.text)}</span></div>`;
+      }
+      return `<div class="transcript-line">${escapeHtml(line.text)}</div>`;
+    }).join("");
+  }
+
+  const transcriptContent = storedTranscriptHtml
+    ? storedTranscriptHtml
+    : (isActive ? '<div style="color:#555;font-style:italic">Listening for transcript...</div>' : '');
+
   tile.innerHTML = `
     <span class="bot-tile-name">${bot.name}</span>
     <span class="bot-tile-status-text">${formatStatus(bot.status)}</span>
     <div class="bot-tile-indicator ${isActive ? "active" : ""}"></div>
     <div class="feature-toggle ${isActive ? "on" : ""}" data-bot-id="${bot.id}"></div>
-    <div class="bot-tile-transcript" id="transcript-${bot.id}">${isActive ? '<div style="color:#555;font-style:italic">Listening for transcript...</div>' : ''}</div>
+    <div class="bot-tile-transcript" id="transcript-${bot.id}" ${storedTranscriptHtml ? 'data-has-data="1"' : ''}>${transcriptContent}</div>
   `;
 
   tile.querySelector(".feature-toggle").addEventListener("click", async () => {
@@ -1016,8 +1063,8 @@ async function updateTranscript(botId) {
     const el = document.getElementById(`transcript-${botId}`);
     if (!el) return;
 
-    // Skip poll if this bot is already receiving real-time WebSocket data
-    if (el.dataset.realtime === "1") return;
+    // Skip poll if this bot is already receiving real-time WebSocket data or has stored transcripts
+    if (el.dataset.realtime === "1" || el.dataset.hasData === "1") return;
 
     const data = await bridge.getBotTranscript(botId);
 
@@ -1728,18 +1775,19 @@ toggleAudio.addEventListener("click", async () => {
     try {
       const bots = await bridge.listBots();
       if (Array.isArray(bots) && bots.length > 0) {
+        // Load ALL bots (including done) so transcripts and room state persist
+        activeBots = bots;
+        renderBots();
+
         const active = bots.filter(
           (b) => !["done", "fatal", "media_expired"].includes(b.status)
         );
         if (active.length > 0) {
-          activeBots = active;
-          renderBots();
-      
           startPolling();
-          btnRemoveAll.disabled = false;
-          statusBar.textContent = `Recovered ${active.length} active bot(s)`;
-          return;
         }
+        btnRemoveAll.disabled = false;
+        statusBar.textContent = `Recovered ${bots.length} bot(s) (${active.length} active)`;
+        return;
       }
     } catch {
       // Server not ready yet — retry
@@ -1755,11 +1803,30 @@ function updateDeepgramHint() {
 
 settingsProvider.addEventListener("change", updateDeepgramHint);
 
+const webhookUrlDisplay = document.getElementById("webhook-url-display");
+const btnCopyWebhook = document.getElementById("btn-copy-webhook");
+const btnOpenDashboard = document.getElementById("btn-open-dashboard");
+
 btnSettings.addEventListener("click", async () => {
   const settings = await window.recallBridge.getAppSettings();
   settingsProvider.value = settings.transcriptionProvider || "recallai";
   updateDeepgramHint();
+  // Load webhook URL
+  try {
+    const info = await bridge.getTunnelInfo();
+    webhookUrlDisplay.value = info.smeeUrl || info.webhookUrl || "Starting...";
+  } catch { webhookUrlDisplay.value = "Unavailable"; }
   settingsModal.classList.add("active");
+});
+
+btnCopyWebhook.addEventListener("click", () => {
+  navigator.clipboard.writeText(webhookUrlDisplay.value);
+  btnCopyWebhook.textContent = "Copied!";
+  setTimeout(() => { btnCopyWebhook.textContent = "Copy URL"; }, 2000);
+});
+
+btnOpenDashboard.addEventListener("click", () => {
+  window.recallBridge.openExternal("https://api.recall.ai/dashboard/webhooks/");
 });
 
 settingsCancel.addEventListener("click", () => {
