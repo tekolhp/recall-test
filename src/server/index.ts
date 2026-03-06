@@ -244,6 +244,26 @@ async function recoverBots() {
 const SILENT_JPEG =
   "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AKwA//9k=";
 
+// Custom thumbnail for bot idle state (persisted to disk)
+const THUMB_DIR = path.join(process.cwd(), "media", "thumbnail");
+if (!existsSync(THUMB_DIR)) mkdirSync(THUMB_DIR, { recursive: true });
+
+let customThumbnailB64: string | null = (() => {
+  try {
+    const thumbPath = path.join(THUMB_DIR, "current.jpg");
+    if (existsSync(thumbPath)) {
+      const data = require("node:fs").readFileSync(thumbPath);
+      console.log("[thumbnail] Restored from disk");
+      return data.toString("base64");
+    }
+  } catch {}
+  return null;
+})();
+
+function getThumbnailB64(): string {
+  return customThumbnailB64 || SILENT_JPEG;
+}
+
 // Minimal silent MP3 (required to enable output_audio endpoint)
 const SILENT_MP3 =
   "//uQxAAAAAANIAAAAAExBTUUzLjEwMFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV";
@@ -367,7 +387,7 @@ app.post("/api/bots/activate-output-media", async (_req, res) => {
 });
 
 // Activate video file output on all active bots
-app.post("/api/bots/activate-video-output", async (_req, res) => {
+app.post("/api/bots/activate-video-output", express.json(), async (req, res) => {
   if (!tunnelHttpUrl) {
     res.status(503).json({ error: "No tunnel available" });
     return;
@@ -377,14 +397,15 @@ app.post("/api/bots/activate-video-output", async (_req, res) => {
     return;
   }
 
+  const loop = req.body?.loop !== false;
   let activated = 0;
   for (const [, bot] of bots) {
     if (["done", "fatal", "leaving"].includes(bot.status)) continue;
     try {
-      const url = `${tunnelHttpUrl}/output-media/video`;
+      const url = `${tunnelHttpUrl}/output-media/video?loop=${loop ? "1" : "0"}`;
       if (await setOutputMedia(bot, url)) {
         activated++;
-        console.log(`[bot] ${bot.id} video output activated: ${url}`);
+        console.log(`[bot] ${bot.id} video output activated (loop=${loop}): ${url}`);
       }
     } catch {}
   }
@@ -392,7 +413,7 @@ app.post("/api/bots/activate-video-output", async (_req, res) => {
 });
 
 // Activate music output on all active bots
-app.post("/api/bots/activate-music-output", async (_req, res) => {
+app.post("/api/bots/activate-music-output", express.json(), async (req, res) => {
   if (!tunnelHttpUrl) {
     res.status(503).json({ error: "No tunnel available" });
     return;
@@ -402,14 +423,15 @@ app.post("/api/bots/activate-music-output", async (_req, res) => {
     return;
   }
 
+  const loop = req.body?.loop !== false;
   let activated = 0;
   for (const [, bot] of bots) {
     if (["done", "fatal", "leaving"].includes(bot.status)) continue;
     try {
-      const url = `${tunnelHttpUrl}/output-media/music`;
+      const url = `${tunnelHttpUrl}/output-media/music?loop=${loop ? "1" : "0"}`;
       if (await setOutputMedia(bot, url)) {
         activated++;
-        console.log(`[bot] ${bot.id} music output activated: ${url}`);
+        console.log(`[bot] ${bot.id} music output activated (loop=${loop}): ${url}`);
       }
     } catch {}
   }
@@ -861,7 +883,14 @@ app.use("/hls/webcam", express.static(HLS_DIR, {
 const VIDEO_DIR = path.join(process.cwd(), "media", "video");
 if (!existsSync(VIDEO_DIR)) mkdirSync(VIDEO_DIR, { recursive: true });
 
-let currentVideoFile: string | null = null;
+// Restore video file from disk if it exists
+let currentVideoFile: string | null = (() => {
+  try {
+    const files = require("node:fs").readdirSync(VIDEO_DIR).filter((f: string) => f.startsWith("current"));
+    return files.length > 0 ? files[0] : null;
+  } catch { return null; }
+})();
+if (currentVideoFile) console.log(`[video] Restored from disk: ${currentVideoFile}`);
 
 app.use("/media/video", express.static(VIDEO_DIR, {
   setHeaders: (res) => {
@@ -900,7 +929,14 @@ app.post("/api/upload-video", express.raw({ type: "*/*", limit: "500mb" }), asyn
 const MUSIC_DIR = path.join(process.cwd(), "media", "music");
 if (!existsSync(MUSIC_DIR)) mkdirSync(MUSIC_DIR, { recursive: true });
 
-let currentMusicFile: string | null = null;
+// Restore music file from disk if it exists
+let currentMusicFile: string | null = (() => {
+  try {
+    const files = require("node:fs").readdirSync(MUSIC_DIR).filter((f: string) => f.startsWith("current"));
+    return files.length > 0 ? files[0] : null;
+  } catch { return null; }
+})();
+if (currentMusicFile) console.log(`[music] Restored from disk: ${currentMusicFile}`);
 
 app.use("/media/music", express.static(MUSIC_DIR, {
   setHeaders: (res) => {
@@ -933,15 +969,94 @@ app.post("/api/upload-music", express.raw({ type: "*/*", limit: "500mb" }), asyn
   }
 });
 
-app.get("/output-media/music", (_req, res) => {
+app.use("/media/thumbnail", express.static(THUMB_DIR, {
+  setHeaders: (res) => {
+    res.set("Cache-Control", "no-cache");
+    res.set("Access-Control-Allow-Origin", "*");
+  },
+}));
+
+// Check what media files are already uploaded (for restoring UI on startup)
+app.get("/api/media-status", (_req, res) => {
+  res.json({
+    video: currentVideoFile ? { file: currentVideoFile, url: `/media/video/${currentVideoFile}` } : null,
+    music: currentMusicFile ? { file: currentMusicFile, url: `/media/music/${currentMusicFile}` } : null,
+    thumbnail: customThumbnailB64 ? { url: `/media/thumbnail/current.jpg` } : null,
+  });
+});
+
+// ── Thumbnail upload/remove ──────────────────────────────────────────
+
+app.post("/api/thumbnail", express.json({ limit: "5mb" }), async (req, res) => {
+  const { b64_data } = req.body;
+  if (!b64_data) {
+    res.status(400).json({ error: "Missing b64_data" });
+    return;
+  }
+  try {
+    const thumbPath = path.join(THUMB_DIR, "current.jpg");
+    await writeFile(thumbPath, Buffer.from(b64_data, "base64"));
+    customThumbnailB64 = b64_data;
+    console.log(`[thumbnail] Saved (${b64_data.length} chars)`);
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Push thumbnail to all active bots immediately via output_video
+app.post("/api/thumbnail/push", async (_req, res) => {
+  if (!customThumbnailB64) {
+    res.status(400).json({ error: "No thumbnail set" });
+    return;
+  }
+  const activeBotList = Array.from(bots.values()).filter(
+    (b) => !["done", "fatal", "leaving"].includes(b.status)
+  );
+  if (activeBotList.length === 0) {
+    res.json({ ok: true, pushed: 0 });
+    return;
+  }
+  const body = JSON.stringify({ kind: "jpeg", b64_data: customThumbnailB64 });
+  let pushed = 0;
+  await Promise.allSettled(
+    activeBotList.map((bot) =>
+      fetch(`${BASE_URL}/api/v1/bot/${bot.recallBotId}/output_video/`, {
+        method: "POST",
+        headers: { Authorization: `Token ${API_KEY}`, "Content-Type": "application/json" },
+        body,
+      }).then(async (r) => {
+        if (r.ok) pushed++;
+        else console.error(`[thumbnail] push to ${bot.id}: ${r.status}`);
+      })
+    )
+  );
+  console.log(`[thumbnail] Pushed to ${pushed}/${activeBotList.length} bots`);
+  res.json({ ok: true, pushed });
+});
+
+app.delete("/api/thumbnail", async (_req, res) => {
+  try {
+    const thumbPath = path.join(THUMB_DIR, "current.jpg");
+    await unlink(thumbPath).catch(() => {});
+    customThumbnailB64 = null;
+    console.log("[thumbnail] Removed");
+    res.json({ ok: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/output-media/music", (req, res) => {
   if (!currentMusicFile) {
     res.status(404).send("No music uploaded");
     return;
   }
+  const loop = req.query.loop !== "0";
   res.type("html").send(`<!DOCTYPE html><html><head>
 <style>*{margin:0;padding:0}body{background:#000;overflow:hidden;width:100vw;height:100vh}</style>
 </head><body>
-<audio id="a" autoplay loop src="/media/music/${currentMusicFile}?t=${Date.now()}"></audio>
+<audio id="a" autoplay ${loop ? "loop" : ""} src="/media/music/${currentMusicFile}?t=${Date.now()}"></audio>
 <script>document.getElementById("a").play().catch(()=>{});</script>
 </body></html>`);
 });
@@ -962,16 +1077,17 @@ iframe{width:100%;height:100%;border:none}</style>
 </body></html>`);
 });
 
-app.get("/output-media/video", (_req, res) => {
+app.get("/output-media/video", (req, res) => {
   if (!currentVideoFile) {
     res.status(404).send("No video uploaded");
     return;
   }
+  const loop = req.query.loop !== "0";
   res.type("html").send(`<!DOCTYPE html><html><head>
 <style>*{margin:0;padding:0}body{background:#000;overflow:hidden;width:100vw;height:100vh}
 video{width:100%;height:100%;object-fit:contain}</style>
 </head><body>
-<video id="v" autoplay loop playsinline src="/media/video/${currentVideoFile}?t=${Date.now()}"></video>
+<video id="v" autoplay ${loop ? "loop" : ""} playsinline src="/media/video/${currentVideoFile}?t=${Date.now()}"></video>
 <script>document.getElementById("v").play().catch(()=>{});</script>
 </body></html>`);
 });
@@ -1483,11 +1599,11 @@ app.post("/api/bots/deploy", async (req, res) => {
     botPayload.automatic_video_output = {
       in_call_recording: {
         kind: "jpeg" as const,
-        b64_data: SILENT_JPEG,
+        b64_data: getThumbnailB64(),
       },
       in_call_not_recording: {
         kind: "jpeg" as const,
-        b64_data: SILENT_JPEG,
+        b64_data: getThumbnailB64(),
       },
     };
     botPayload.automatic_audio_output = {

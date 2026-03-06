@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream: http://localhost:8000; connect-src 'self' ws://localhost:3000 http://localhost:8000;" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob: mediastream: http://localhost:8000; connect-src 'self' ws://localhost:3000 http://localhost:3000 http://localhost:8000;" />
   <title>Recall.ai — Bot Fleet</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -416,9 +416,25 @@
     .feature-row .feature-label {
       font-size: 12px;
       color: #999;
-      width: 80px;
+      width: 50px;
       flex-shrink: 0;
       font-weight: 500;
+    }
+    .row-actions {
+      width: 18px;
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .feature-file-name {
+      flex: 1;
+      min-width: 0;
+      font-size: 12px;
+      color: #666;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .feature-row select {
       flex: 1;
@@ -445,6 +461,58 @@
     }
     .feature-btn:hover { background: #252525; }
     .feature-btn:disabled { opacity: 0.35; cursor: default; }
+    .loop-btn {
+      background: none;
+      border: none;
+      color: #333;
+      width: 18px;
+      height: 18px;
+      cursor: pointer;
+      padding: 0;
+      flex-shrink: 0;
+      transition: color 0.2s, opacity 0.2s;
+      opacity: 0.3;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .loop-btn svg {
+      width: 14px;
+      height: 14px;
+    }
+    .loop-btn:hover { opacity: 0.6; }
+    .loop-btn.active {
+      color: #e0e0e0;
+      opacity: 0.9;
+    }
+    .thumb-remove-btn {
+      background: none;
+      border: none;
+      color: #555;
+      width: 18px;
+      height: 18px;
+      cursor: pointer;
+      padding: 0;
+      flex-shrink: 0;
+      transition: color 0.2s, opacity 0.2s;
+      opacity: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+    .thumb-remove-btn svg {
+      width: 12px;
+      height: 12px;
+    }
+    .thumb-remove-btn.visible {
+      opacity: 0.5;
+      pointer-events: auto;
+    }
+    .thumb-remove-btn.visible:hover {
+      opacity: 1;
+      color: #ff4444;
+    }
     .feature-url-input {
       flex: 1;
       min-width: 0;
@@ -681,8 +749,17 @@
         <span class="preview-placeholder" id="preview-placeholder">Drop image, video, or audio here</span>
       </div>
       <div class="output-features">
+        <div class="feature-row" id="row-thumbnail">
+          <span class="feature-label">Thumbnail</span>
+          <span class="row-actions"><button class="thumb-remove-btn" id="thumb-remove" title="Remove thumbnail"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button></span>
+          <span class="feature-file-name" id="thumb-file-name">Select image</span>
+          <div class="feature-toggle" id="toggle-thumbnail"></div>
+          <div class="feature-indicator" id="ind-thumbnail"></div>
+          <input type="file" id="thumb-file-input" accept="image/*" style="display:none" />
+        </div>
         <div class="feature-row" id="row-camera">
           <span class="feature-label">Camera</span>
+          <span class="row-actions"></span>
           <select id="camera-source">
             <option value="">-- Source --</option>
             <option value="screen">Screen Capture</option>
@@ -692,6 +769,7 @@
         </div>
         <div class="feature-row" id="row-audio">
           <span class="feature-label">Audio</span>
+          <span class="row-actions"></span>
           <select id="audio-source">
             <option value="">-- Device --</option>
           </select>
@@ -700,24 +778,28 @@
         </div>
         <div class="feature-row" id="row-image">
           <span class="feature-label">Image</span>
-          <span class="feature-file-name" id="image-file-name" style="flex:1;font-size:12px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Upload</span>
+          <span class="row-actions"></span>
+          <span class="feature-file-name" id="image-file-name">Upload</span>
           <div class="feature-toggle" id="toggle-image"></div>
           <div class="feature-indicator" id="ind-image"></div>
         </div>
         <div class="feature-row" id="row-video">
           <span class="feature-label">Video</span>
-          <span class="feature-file-name" id="video-file-name" style="flex:1;font-size:12px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Upload</span>
+          <span class="row-actions"><button class="loop-btn active" id="loop-video" title="Toggle loop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></button></span>
+          <span class="feature-file-name" id="video-file-name">Upload</span>
           <div class="feature-toggle" id="toggle-video"></div>
           <div class="feature-indicator" id="ind-video"></div>
         </div>
         <div class="feature-row" id="row-music">
           <span class="feature-label">Music</span>
-          <span class="feature-file-name" id="music-file-name" style="flex:1;font-size:12px;color:#666;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">Upload</span>
+          <span class="row-actions"><button class="loop-btn active" id="loop-music" title="Toggle loop"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 2l4 4-4 4"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><path d="M7 22l-4-4 4-4"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg></button></span>
+          <span class="feature-file-name" id="music-file-name">Upload</span>
           <div class="feature-toggle" id="toggle-music"></div>
           <div class="feature-indicator" id="ind-music"></div>
         </div>
         <div class="feature-row" id="row-url">
           <span class="feature-label">URL</span>
+          <span class="row-actions"></span>
           <input type="text" class="feature-url-input" id="url-input" placeholder="https://example.com/page" />
           <div class="feature-toggle" id="toggle-url"></div>
           <div class="feature-indicator" id="ind-url"></div>

@@ -37,15 +37,21 @@ const btnPickVideo = document.getElementById("btn-pick-video");
 const videoFileInput = document.getElementById("video-file-input");
 const toggleVideo = document.getElementById("toggle-video");
 const indVideo = document.getElementById("ind-video");
+const loopVideo = document.getElementById("loop-video");
 const btnPickMusic = document.getElementById("btn-pick-music");
 const musicFileInput = document.getElementById("music-file-input");
 const toggleMusic = document.getElementById("toggle-music");
 const indMusic = document.getElementById("ind-music");
+const loopMusic = document.getElementById("loop-music");
 const urlInput = document.getElementById("url-input");
 const toggleUrl = document.getElementById("toggle-url");
 const indUrl = document.getElementById("ind-url");
 const toggleAudio = document.getElementById("toggle-audio");
 const indAudio = document.getElementById("ind-audio");
+const thumbFileName = document.getElementById("thumb-file-name");
+const thumbFileInput = document.getElementById("thumb-file-input");
+const thumbRemove = document.getElementById("thumb-remove");
+const rowThumbnail = document.getElementById("row-thumbnail");
 
 // Feature row containers (clickable)
 const rowCamera = document.getElementById("row-camera");
@@ -1229,6 +1235,94 @@ async function deactivateAllOutputsAndApi() {
 
 // ── Camera toggle ─────────────────────────────────────────────────────
 
+// ── Thumbnail (bot idle image) ────────────────────────────────────────
+
+let thumbnailSet = false;
+
+rowThumbnail.addEventListener("click", (e) => {
+  if (e.target.closest(".thumb-remove-btn")) return;
+  thumbFileInput.click();
+});
+
+thumbFileInput.addEventListener("change", async () => {
+  const file = thumbFileInput.files?.[0];
+  if (!file) return;
+  thumbFileInput.value = "";
+
+  const displayName = file.name.length > 20 ? file.name.slice(0, 17) + "..." : file.name;
+  thumbFileName.textContent = "Processing...";
+  thumbFileName.style.color = "#ffab00";
+
+  try {
+    // Convert to JPEG base64 via canvas (resize to 1280x720)
+    const b64 = await new Promise((resolve, reject) => {
+      const img = new Image();
+      const blobUrl = URL.createObjectURL(file);
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = 1280;
+        canvas.height = 720;
+        const ctx = canvas.getContext("2d");
+        const scale = Math.max(1280 / img.width, 720 / img.height);
+        const w = img.width * scale;
+        const h = img.height * scale;
+        ctx.drawImage(img, (1280 - w) / 2, (720 - h) / 2, w, h);
+        URL.revokeObjectURL(blobUrl);
+        resolve(canvas.toDataURL("image/jpeg", 0.92).split(",")[1]);
+      };
+      img.onerror = () => { URL.revokeObjectURL(blobUrl); reject(new Error("Failed to load image")); };
+      img.src = blobUrl;
+    });
+
+    // Save to server
+    const res = await fetch("http://localhost:3000/api/thumbnail", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ b64_data: b64 }),
+    });
+    const result = await res.json();
+    if (!result.ok) throw new Error(result.error || "Upload failed");
+
+    thumbnailSet = true;
+    thumbFileName.textContent = displayName;
+    thumbFileName.style.color = "#ccc";
+    thumbRemove.classList.add("visible");
+    streamImage.src = `data:image/jpeg;base64,${b64}`;
+    showPreview("image");
+
+    // Push to active bots immediately
+    const pushRes = await fetch("http://localhost:3000/api/thumbnail/push", { method: "POST" });
+    const pushResult = await pushRes.json();
+    if (pushResult.pushed > 0) {
+      statusBar.textContent = `Thumbnail set — pushed to ${pushResult.pushed} bot(s)`;
+    } else {
+      statusBar.textContent = "Thumbnail saved — will apply to new bots";
+    }
+  } catch (err) {
+    thumbFileName.textContent = "Select image";
+    thumbFileName.style.color = "#666";
+    statusBar.textContent = `Thumbnail failed: ${err.message}`;
+    console.error("[thumbnail]", err);
+  }
+});
+
+thumbRemove.addEventListener("click", async (e) => {
+  e.stopPropagation();
+  try {
+    await fetch("http://localhost:3000/api/thumbnail", { method: "DELETE" });
+    thumbnailSet = false;
+    thumbFileName.textContent = "Select image";
+    thumbFileName.style.color = "#666";
+    thumbRemove.classList.remove("visible");
+    showPreview("none");
+    statusBar.textContent = "Thumbnail removed — new bots will use default";
+  } catch (err) {
+    statusBar.textContent = `Failed to remove thumbnail: ${err.message}`;
+  }
+});
+
+// ── Camera toggle ─────────────────────────────────────────────────────
+
 let videoRecorder = null;
 
 // Populate video input device list
@@ -1617,8 +1711,9 @@ rowImage.addEventListener("click", () => {
 });
 
 // Video row: click to pick file or toggle on/off
-rowVideo.addEventListener("click", () => {
+rowVideo.addEventListener("click", (e) => {
   if (outputToggleBusy) return;
+  if (e.target.closest(".loop-btn")) return;
   if (toggleVideo.classList.contains("on")) {
     toggleVideo.click(); // turn off
   } else {
@@ -1627,8 +1722,9 @@ rowVideo.addEventListener("click", () => {
 });
 
 // Music row: click to pick file or toggle on/off
-rowMusic.addEventListener("click", () => {
+rowMusic.addEventListener("click", (e) => {
   if (outputToggleBusy) return;
+  if (e.target.closest(".loop-btn")) return;
   if (toggleMusic.classList.contains("on")) {
     toggleMusic.click(); // turn off
   } else {
@@ -1688,17 +1784,20 @@ videoFileInput.addEventListener("change", async () => {
 });
 
 async function activateVideoOutput() {
+  const videoLoop = loopVideo.classList.contains("active");
   try {
-    const result = await bridge.activateVideoOutput();
+    const result = await bridge.activateVideoOutput(videoLoop);
     if (result.error) {
       statusBar.textContent = `Video activation failed: ${result.error}`;
       return;
     }
-    streamVideo.srcObject = null;
-    streamVideo.src = videoFileUrl;
-    streamVideo.loop = true;
-    streamVideo.play().catch(() => {});
-    showPreview("video");
+    if (videoFileUrl) {
+      streamVideo.srcObject = null;
+      streamVideo.src = videoFileUrl;
+      streamVideo.loop = videoLoop;
+      streamVideo.play().catch(() => {});
+      showPreview("video");
+    }
     toggleVideo.classList.add("on");
     indVideo.classList.add("active");
     statusBar.textContent = `Video output active on ${result.activated} bot(s)`;
@@ -1706,6 +1805,18 @@ async function activateVideoOutput() {
     statusBar.textContent = `Video activation failed: ${err.message}`;
   }
 }
+
+// Loop toggle buttons
+loopVideo.addEventListener("click", (e) => {
+  e.stopPropagation();
+  loopVideo.classList.toggle("active");
+  // Update local preview loop state if playing
+  if (streamVideo) streamVideo.loop = loopVideo.classList.contains("active");
+});
+loopMusic.addEventListener("click", (e) => {
+  e.stopPropagation();
+  loopMusic.classList.toggle("active");
+});
 
 toggleVideo.addEventListener("click", async () => {
   if (outputToggleBusy) return;
@@ -1735,11 +1846,12 @@ toggleVideo.addEventListener("click", async () => {
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "Video feed cleared";
     } else {
-      const result = await bridge.activateVideoOutput();
+      const videoLoop = loopVideo.classList.contains("active");
+      const result = await bridge.activateVideoOutput(videoLoop);
       if (result.error) throw new Error(result.error);
       streamVideo.srcObject = null;
       streamVideo.src = videoFileUrl;
-      streamVideo.loop = true;
+      streamVideo.loop = videoLoop;
       streamVideo.play().catch(() => {});
       showPreview("video");
       indVideo.classList.add("active");
@@ -1844,7 +1956,8 @@ toggleMusic.addEventListener("click", async () => {
       await bridge.deactivateOutputMedia().catch(() => {});
       statusBar.textContent = "Music feed cleared";
     } else {
-      const result = await bridge.activateMusicOutput();
+      const musicLoop = loopMusic.classList.contains("active");
+      const result = await bridge.activateMusicOutput(musicLoop);
       if (result.error) throw new Error(result.error);
       showPreview("none");
       indMusic.classList.add("active");
@@ -2063,3 +2176,43 @@ settingsSave.addEventListener("click", async () => {
   });
   settingsModal.classList.remove("active");
 });
+
+// ── Restore previously uploaded media on startup ─────────────────────
+(async function restoreMediaState() {
+  try {
+    const res = await fetch("http://localhost:3000/api/media-status");
+    const status = await res.json();
+
+    if (status.video) {
+      videoUploaded = true;
+      videoFileUrl = `http://localhost:3000${status.video.url}`;
+      const name = status.video.file;
+      const displayName = name.length > 20 ? name.slice(0, 17) + "..." : name;
+      videoFileName.textContent = displayName;
+      videoFileName.style.color = "#ccc";
+      console.log("[restore] Video file ready:", name);
+    }
+
+    if (status.music) {
+      musicUploaded = true;
+      const name = status.music.file;
+      const displayName = name.length > 20 ? name.slice(0, 17) + "..." : name;
+      musicFileName.textContent = displayName;
+      musicFileName.style.color = "#ccc";
+      console.log("[restore] Music file ready:", name);
+    }
+
+    if (status.thumbnail) {
+      thumbnailSet = true;
+      thumbFileName.textContent = "Custom image";
+      thumbFileName.style.color = "#ccc";
+      thumbRemove.classList.add("visible");
+      // Show in preview
+      streamImage.src = `http://localhost:3000${status.thumbnail.url}?t=${Date.now()}`;
+      showPreview("image");
+      console.log("[restore] Thumbnail ready");
+    }
+  } catch (err) {
+    console.warn("[restore] Could not check media status:", err);
+  }
+})();

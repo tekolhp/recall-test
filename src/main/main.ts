@@ -625,10 +625,14 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("activate-music-output", async () => {
+  ipcMain.handle("activate-music-output", async (_event, loop?: boolean) => {
     if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
     try {
-      const res = await fetch(`${BACKEND_URL}/api/bots/activate-music-output`, { method: "POST" });
+      const res = await fetch(`${BACKEND_URL}/api/bots/activate-music-output`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ loop: loop !== false }),
+      });
       return await res.json();
     } catch (err: any) {
       return { error: err.message };
@@ -649,10 +653,14 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle("activate-video-output", async () => {
+  ipcMain.handle("activate-video-output", async (_event, loop?: boolean) => {
     if (!toggles.botFleet) return { error: "Bot Fleet is disabled" };
     try {
-      const res = await fetch(`${BACKEND_URL}/api/bots/activate-video-output`, { method: "POST" });
+      const res = await fetch(`${BACKEND_URL}/api/bots/activate-video-output`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ loop: loop !== false }),
+      });
       return await res.json();
     } catch (err: any) {
       return { error: err.message };

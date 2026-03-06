@@ -79,12 +79,12 @@ contextBridge.exposeInMainWorld("recallBridge", {
   getNgrokStatus: () => ipcRenderer.invoke("get-ngrok-status"),
   uploadVideo: (fileName: string, buffer: ArrayBuffer) =>
     ipcRenderer.invoke("upload-video", fileName, Buffer.from(buffer)),
-  activateVideoOutput: () =>
-    ipcRenderer.invoke("activate-video-output"),
+  activateVideoOutput: (loop?: boolean) =>
+    ipcRenderer.invoke("activate-video-output", loop),
   uploadMusic: (fileName: string, buffer: ArrayBuffer) =>
     ipcRenderer.invoke("upload-music", fileName, Buffer.from(buffer)),
-  activateMusicOutput: () =>
-    ipcRenderer.invoke("activate-music-output"),
+  activateMusicOutput: (loop?: boolean) =>
+    ipcRenderer.invoke("activate-music-output", loop),
   activateYouTube: (videoId: string) =>
     ipcRenderer.invoke("activate-youtube", videoId),
   pushOutputMediaFrame: (b64Data: string) =>
